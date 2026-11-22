@@ -16,7 +16,17 @@ privately run AzerothCore server.
 5. WASD disabled unless switched on.
 6. Everything reversible with one switch.
 
-Goals 1, 2, 3, 5 and 6 are built. Goal 4 is next.
+Goals 1, 2, 3, 5 and 6 are built. Added since, from playing it:
+
+7. Move clicks stay at ground level: a click on a roof or a treetop goes to
+   the ground under the cursor. (Built.)
+8. Sound is heard from the camera, not from the character. (Built.)
+9. A chosen skill on the left mouse button, and on the right when WASD is on.
+   Clicking an enemy walks into the skill's range and uses it; clicking a
+   friend, a quest giver or an object interacts as before. Each has its own
+   button on screen next to the action bar. (Next.)
+10. A bigger minimap that can be clicked to walk there, and a world map in a
+    window that can be clicked to travel there. (Planned.)
 
 ## Three layers
 
@@ -126,8 +136,15 @@ AIO patcher or awesome_wotlk's patcher first.
 | `version, features = ARPG_ClientVersion()` | Its presence is how the addon detects the library. `features` is a bit set of the hooks that went in: 1 Lua functions, 2 hold-to-move, 4 camera angles, 8 camera distance |
 | `ARPG_HoldStart()` / `ARPG_HoldStop()` | The move button went down / came up |
 | `ARPG_SetHoldInterval(ms)` | How often a held button re-issues the move (default 100, limits 10 to 2000) |
-| `ARPG_SetCamera(yawDeg, pitchDeg, distance [, collide])` | Lock the camera. Yaw 0 looks north, positive turns counter-clockwise; pitch is degrees below the horizon (limit 89); distance in yards (limit 200); `collide` lets walls shorten the distance |
+| `ARPG_SetGroundClicks(maxRise)` | Move clicks that land more than `maxRise` yards above the character's feet go to the ground under the cursor. No argument: off |
+| `ARPG_MoveTo(x, y [, z])` | Click-to-move to a spot in world coordinates (x north, y west), as a right click there would. For maps |
+| `x, y, z = ARPG_PlayerPosition()` | The character's world position; nothing outside the world |
+| `ARPG_SetCamera(yawDeg, pitchDeg, distance [, collide])` | Lock the camera. Yaw 0 looks north, positive turns counter-clockwise; pitch is degrees below the horizon (limit 89); distance in yards (2 to 200); `collide` lets walls shorten the distance |
 | `ARPG_SetCamera()` | Release the camera |
+| `asked, angleRuns, angleLocked, distanceRuns, distanceLocked = ARPG_CameraInfo()` | Whether a lock is asked for, how often the client has run its two camera routines since the UI loaded, and in how many of those runs the lock was applied. `/arpg status` shows it: a lock that is asked for but never applied is a bug |
+
+Functions added after 0.2.0 are detected by their presence, not by a feature
+bit.
 
 ### Mechanisms
 
@@ -140,29 +157,61 @@ unit or object it targets and interacts, walking into range by itself.
 
 The library hooks the per-frame handler (`0x00495810`) and, while the button
 is held, calls those same two routines: once on the press, whatever is under
-the cursor, and then every 100 ms as long as terrain is under the cursor.
-A held button never re-clicks a unit. If a spell is waiting for a target the
-press is delivered as a left click instead, which places the spell or picks
-the unit, and nothing repeats. The left mouse button itself is rebound by the
-addon to `WOTLKARPG_HOLDMOVE`, so the stock binding that turns the camera
-never runs.
+the cursor, and then every 100 ms. A press on a unit or object is one
+interaction and the rest of that hold does nothing, so that a creature
+walking out from under the cursor cannot call the character off. A press on
+the ground starts a walk, which repeats; a walk never clicks a unit it passes
+over. If a spell is waiting for a target the press is delivered as a left
+click instead, which places the spell or picks the unit, and nothing repeats.
+The left mouse button itself is rebound by the addon to `WOTLKARPG_HOLDMOVE`,
+so the stock binding that turns the camera never runs.
 
-Open question until proven in game: whether re-issuing click-to-move ten
-times a second looks and feels right (the move marker, stutter). Fallbacks:
-call the click-to-move routine directly (`0x00727400`), skip re-issues when
-the cursor's ground point has barely moved, or steer by facing.
+**Ground clicks.** The capture also stores the cursor's ray, from the camera
+to the far end (world frame `+0x2F8` and `+0x304`). The static world is one
+kind of hit, whether terrain, building or tree, so a roof cannot be told from
+a hillside by kind. What the library does instead: if the hit is more than
+`maxRise` (3 yards) above the character's feet, it replaces the stored hit
+position with the point where the ray passes through the height of the feet,
+before the click is acted on. During a walk the same point is used to keep
+going while the cursor is over a unit (through the terrain-click routine,
+`0x00527830`). On foot, click-to-move judges arrival by x and y alone, so the
+height of that point does not have to match the real ground. The cost is on
+slopes: a click far up a hillside is treated like a roof and lands further up
+the screen. Possible refinement: cast the ray on from the hit (world
+intersect `0x0077F310`, flags `0x100151` as the client's own click test uses)
+and only treat the hit as a roof if something lies beneath it.
 
-**Camera lock.** Every frame the client computes the camera's angles
-(`0x00604490`), builds its matrix from them, then computes its distance from
-the character after collision (`0x00605D60`). The library hooks both. After
-the first it overwrites yaw and pitch with the locked values and rebuilds the
-matrix (`0x00607BD0`). Around the second it lends the camera the locked
-distance and, unless collision is wanted, sets the camera flag that makes the
-routine return the wanted distance untouched; everything it changed is put
-back when the call returns. So the client's own camera state is never
-altered, mouse-look and zoom still change it out of sight, and releasing the
-lock shows the client's camera again. Cameras driven by a model animation,
-and any camera that is not the world frame's active one, are left alone.
+**Camera lock.** Every frame the client's camera update (`0x00606F90`)
+computes the camera's angles (`0x00604490`, which also builds the matrix),
+then its distance from the character after collision (`0x00605D60`), then
+places the camera that far behind the character along the matrix's forward
+axis (`0x00601D60`). The library hooks the first two.
+
+- Angles: after the client's routine, yaw and pitch are overwritten with the
+  locked values and the matrix is rebuilt (`0x00607BD0`). The client's own
+  yaw and pitch are not touched: mouse-look still changes them, out of sight,
+  and they are what shows again when the lock is released.
+- Distance: the camera's own zoom (`+0x118`, and the zoom to return to after
+  a collision, `+0x1E8`) is kept at the locked distance for as long as the
+  lock lasts, and the player's zoom is put back afterwards. Lending the
+  distance for the one call is not enough: other parts of the client ask the
+  zoom, not the camera's position, how close the camera is. Below 1.83 yards
+  they treat the view as first person (`0x005FE3A0`), and the update itself
+  compares zoom and distance to detect a collision.
+- No collision: the distance routine returns the zoom untested while the
+  camera's first-person flag (`0x8`) is set. The library raises the flag for
+  that one call and lowers it before the caller looks, because the caller
+  would otherwise use a distance of zero.
+
+Only the world frame's active camera is touched. Cameras driven by a model
+(cinematics) go through a different update and never reach these routines.
+
+0.2.0 shipped with the lock dead. `game.h` had flag `0x4` down as "driven by
+a model" and skipped any camera that had it set; it is in fact set on every
+camera once it has been set up on its target. The mock client shared the
+misreading, so the tests passed. The mock now reproduces the client's camera
+update step by step, flags included, and `/arpg status` reports from the
+library's own counters whether the lock is being applied.
 
 Until the cutaway exists the addon asks for collision while `IsIndoors()` is
 true (an option, on by default): a camera above a roof shows roof.
@@ -186,10 +235,13 @@ Four things stand in for the game, which CI cannot run:
    memory at the client's addresses, puts a routine with the right calling
    convention (and the client's exact first bytes, where the library patches)
    at each address the library uses, lets the library start, and then acts
-   like the client: loads the UI, calls the Lua functions, runs frames, moves
-   the camera. It is built twice: as a 32-bit Linux program with the library
-   compiled in (`client/test/run.sh`), and as a Windows program that loads the
-   real DLL (`mock-client.exe`, run by CI on Windows).
+   like the client: loads the UI, calls the Lua functions, runs frames, runs
+   camera updates the way the client's own update routine does. It is built
+   twice: as a 32-bit Linux program with the library compiled in
+   (`client/test/run.sh`), and as a Windows program that loads the real DLL
+   (`mock-client.exe`, run by CI on Windows). It is only as good as its
+   picture of the client: where the two disagree, the game wins, and the mock
+   gets corrected from the disassembly.
 4. `client/test/installer_test.py` - the setup script against a made-up
    `Wow.exe`, under Windows PowerShell 5.1 and PowerShell 7.
 
@@ -209,20 +261,27 @@ at `0x00400000`.
 | UI root | `*0x00B499A8` | |
 | In-world flag | `0x00BD0792` | byte |
 | World frame | `*0x00B7436C` | active camera pointer at `+0x7E20` |
-| Capture what is under the cursor | `0x004FA570` | thiscall on the world frame, no arguments. Result: kind at `+0x2D8` (0 nothing, 1 terrain, 2 unit or object, 3 building), guid at `+0x2E0`, position at `+0x2E8` |
+| Capture what is under the cursor | `0x004FA570` | thiscall on the world frame, no arguments. Result: kind at `+0x2D8`, guid at `+0x2E0`, hit position at `+0x2E8`, the cursor's ray at `+0x2F8` (start) and `+0x304` (end) |
+| Kinds of hit | | 0 nothing; 1 the static world (terrain, buildings, trees alike); 2 a unit or object to interact with; 3 the solid shape of a game object (a ship's deck). A hit on a transport carries its guid and a position in the transport's coordinates |
+| Cursor ray from screen coordinates | `0x004F6450` | thiscall on the world frame: x, y, Vec3* start, Vec3* end |
 | Hit-test a screen point | `0x004F9DA0` | thiscall on the world frame: x, y, filter, result. Returns nothing unless bit 0 of the input control's flags (`*0x00C24954 + 0x58`) is set |
 | Act on the captured result | `0x004F7880` | thiscall on the world frame: button (1 left, 4 right) |
-| Terrain click | `0x00527830` -> `0x00527360` | cdecl, one struct: guid, position, button. Left: a waiting spell takes it (`0x0080C340`). Right: `0x0072B6D0` on the player, then click-to-move `0x00727400` if the `autointeract` CVar is on |
+| Terrain click | `0x00527830` -> `0x00527360` | cdecl, one struct: transport guid or zero, position, button. Left: a waiting spell takes it (`0x0080C340`). Right: `0x0072B6D0` on the player, then click-to-move `0x00727400` if the `autointeract` CVar is on |
+| Click-to-move | `0x00727400`, per-frame `0x007317A0` | thiscall on the player: action (4 walk to a spot, 13 none), guid*, position*, float. State at `0x00CA11F4` (action) and `0x00CA1264` (destination). No distance limit for action 4. On foot, arrival is judged in x and y only; swimming or flying, in all three. Can give up after five updates without getting closer |
 | Unit or object click | `0x00527870` | left `0x005274F0`, right `0x005277B0`, both cdecl (guid) |
 | Spell waiting for a target | `*0x00D3F4E4` | non-null while targeting; what `SpellIsTargeting()` tests |
-| Object by guid | `0x004D4DB0` | cdecl: guid low, guid high, type mask, file, line |
-| Player guid | `0x004D3790` | returns in edx:eax |
-| Camera update | `0x00606F90` | called from `0x00607B00`; cameras driven by a model go to `0x00601E90` instead |
+| Object by guid | `0x004D4DB0` | cdecl: guid low, guid high, type mask (`0x10` player, `0x8` unit, `0x1` any), file, line |
+| Player guid | `0x004D3790` | returns in edx:eax; reads thread-local data |
+| Object virtuals | | slot 11 (`+0x2C`): Vec3* GetPosition(Vec3* out); slot 13 (`+0x34`): float GetFacing() |
+| Camera update | `0x00606F90` | thiscall: target, time. Called from `0x00607B00`; cameras driven by a model go to `0x00601E90` instead |
+| Camera position from pivot and distance | `0x00601D60` | thiscall: Vec3* out, Vec3* pivot, float distance, Vec3* extra. Result goes to the camera's `+0x08` |
+| First-person test used outside the camera code | `0x005FE3A0` | zoom below 1.8315 |
 | Camera angles | `0x00604490` | thiscall: target, float* yaw, float* pitch, float* roll |
 | Camera matrix from angles | `0x00607BD0` | thiscall: yaw, pitch, roll. Matrix at `+0x14`; forward is (cos yaw cos pitch, sin yaw cos pitch, -sin pitch), so yaw 0 is north and positive pitch looks down |
-| Camera distance after collision | `0x00605D60` | thiscall, 6 arguments. Returns early with the wanted distance if flag `0x8` is set. World intersection calls at `0x00605F00` and `0x006060FE` |
-| Camera fields | | `+0x98` flags (`0x4` model-driven, `0x8` no collision), `+0x118` wanted distance, `+0x1E8` distance blend, `+0x11C` and `+0x12C` yaw terms, `+0x120` pitch, `+0x124` roll |
-| World intersect (ray cast) | `0x0077F310` | |
+| Camera distance after collision | `0x00605D60` | thiscall, 6 arguments. Starts from the larger of zoom and zoom blend. Returns flag bits that the caller ORs into the flags. Returns early with the zoom if flag `0x8` is set. World intersection calls at `0x00605F00` and `0x006060FE` |
+| Camera fields | | `+0x08` position, `+0x14` matrix, `+0x98` flags (`0x4` set up on its target, the normal state; `0x8` first person), `+0x118` zoom, `+0x1E8` zoom to return to after a collision, `+0x11C` and `+0x12C` yaw terms, `+0x120` pitch, `+0x124` roll |
+| World intersect (ray cast) | `0x0077F310` | cdecl: Vec3* start, Vec3* end, Vec3* out, float* fraction (in: 1.0), flags, 0. Returns whether anything was hit. The click test uses flags `0x100151` |
+| Lua state creation and registration | `0x0052A980` | sets up the UI's scripting (`0x0081A9A0`), then calls `0x005120E0`, which registers the client's functions. Two callers |
 | Register a Lua function | `0x00817F90` | cdecl: name, function |
 | Last block of the client's Lua registrations | `0x00530F60` | ends in `ret` at `0x00530F85`; tail-called from `0x005120E0` |
 | Lua function address check | `0x0086B5A0` | range at `0x00D415B8`/`0x00D415BC`, filled in lazily by `0x0086B510` when either is zero |
@@ -239,7 +298,33 @@ Not yet verified, from the awesome_wotlk projects' headers, for the cutaway:
 | Camera's building, if inside one | `*0x00CD87A4` | null outdoors |
 | Graphics device draw | `0x006A3620` | thiscall on the D3D device wrapper |
 
-## Next: the cutaway
+## Next: skills on the mouse buttons
+
+A press on an enemy should use a chosen skill, walking into range first. The
+pieces:
+
+- Addon: two skill slots (left button; right button when WASD is on), shown
+  as extra buttons by the action bar, filled by dragging a spell onto them.
+  At the press, the addon knows whether the unit under the cursor is an enemy
+  (`UnitCanAttack("player", "mouseover")`) and the skill's range
+  (`GetSpellInfo`).
+- Library: casting and targeting are protected from addon code, so the
+  library has to do them: target the unit that was captured, walk towards it
+  until the skill is in range, stop, cast. The simplest route is to run a
+  line of Lua from the frame hook, where nothing is tainted, rather than to
+  call the client's spell code directly.
+
+## Then: maps
+
+- Minimap (in CleanMinimap-WotLK): larger, and a click on it calls
+  `ARPG_MoveTo` with the character's position plus the click's offset. Walks
+  in a straight line, like any click-to-move.
+- World map (in BetterMaps-WotLK): a window, and a click on it travels there.
+  That needs real pathfinding, which the client does not have and the server
+  does: a small AzerothCore module that answers "path from here to there"
+  from its navigation meshes, and the library following the waypoints.
+
+## Later: the cutaway
 
 The client draws building interiors by walking portals (doorways, windows)
 outward from the camera. A camera above the roof sees no portals, so no rooms
@@ -248,7 +333,7 @@ the walk treat the character's room as the starting point, (2) clip
 everything above head height with a clip plane that follows the character's
 height. This is the least certain part of the project.
 
-## Later
+## Further out
 
 - Diablo-style WASD (W moves up the screen), skills aimed at the cursor.
 - **Spell.dbc** (client MPQ and server together): facing requirements,
