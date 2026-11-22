@@ -30,8 +30,8 @@ in from, with or without this addon, finds your settings as you left them.
 | Sound heard from the camera, so left and right match the screen | addon | done |
 | Settings panel; settings shared by every character | addon | done |
 | The game's own settings as you left them on every other client | addon | fixed in 0.4.0 |
-| Indoors, the building shown from inside, looked into from above, on black | client library | new in 0.4.0, not yet proven in game |
-| Indoors, walls, beams and upper floors cut off at a set height | client library | works in game |
+| Indoors, the building shown from inside, looked into from above, on black | client library | reworked in 0.5.0 after its first test in game; not yet proven |
+| Indoors, walls, beams and upper floors cut off at a set height | client library | worked in game up to 0.4.0; done another way in 0.5.0, not yet proven |
 | Outdoors, the world sliced open when a building hides the character | client library | rough; off unless asked for |
 | A skill on the left mouse button (and the right, with WASD on): walk into range, then cast | addon + client library | next |
 | Bigger minimap; click it to walk there | addon + client library | planned |
@@ -104,19 +104,24 @@ While the mode is on:
 - **Indoors** you see the building from inside and nothing else. The roof
   and the walls on the camera's side are left out, so you look into the
   rooms from above; the street, the hills and the sky are not drawn at all,
-  and the screen is black where the building ends. Rooms that open off the
-  one you are in are shown too. Whatever is more than 4 yards above your
-  feet is cut away: beams, galleries, the floor upstairs and the tops of the
-  walls. Under a ceiling lower than that the cut is made just below the
-  ceiling, and a tall room keeps its walls up to its ceiling. Clicks and
-  hover go through everything that is left out. Upstairs, the cut goes up
-  with you.
+  and the screen is black where the building ends. Every room you could
+  walk to from yours without going outdoors is shown, whole. Whatever is
+  more than 4 yards above your feet is cut away: beams, galleries, the floor
+  upstairs and the tops of the walls. Under a ceiling lower than that the
+  cut is made just below the ceiling, and a tall room keeps its walls up to
+  its ceiling. Clicks and hover go through everything that is left out.
+  Upstairs, the cut goes up with you.
+- **What counts as indoors** is the game's own answer, the one that decides
+  where you may ride. A city's streets, squares and bridges are outdoors,
+  although the game builds many of them as part of the same model as the
+  houses; so are most porches and gateways. You step from one picture into
+  the other at the door.
 - **Outdoors** nothing changes, unless you ask for it: with "Outdoors, slice
   the world when a building hides you" ticked, everything above the part of
   a building that stands between the camera and your character is cut away,
-  all over the screen. It keeps the character in view under an archway or
-  behind a house. It is rough: other buildings are sliced open too, and many
-  of them are hollow.
+  all over the screen. It keeps the character in view under an archway, a
+  porch roof or behind a house. It is rough: other buildings are sliced open
+  too, and many of them are hollow.
 - **Scroll wheel and right mouse button**: do nothing, for now.
 
 In the options, drag a slider or roll the mouse wheel over it for single
@@ -144,20 +149,27 @@ Without the client library the addon still works: one click per move,
 
 ### What the inside view cannot do yet
 
-- A building is shown from inside wherever the game itself can tell which
-  room your character stands in. Where it cannot (`/arpg status` says "this
-  building is not found from inside"), the world is drawn as usual and sliced
-  open at the wall height instead, as 0.3.0 did everywhere.
-- Rooms on the camera's side of the one you are in are not shown: they would
-  be in the way.
+- The picture changes at the door, at once: there is no fade yet.
+- Under a porch roof or an archway that the game counts as outdoors you are
+  outdoors, and the roof is drawn. The "Outdoors, slice the world" option is
+  the only help there so far.
+- Where the game has you indoors but cannot tell which room you stand in
+  (`/arpg status` says "this building is not found from inside"), the world
+  is drawn as usual and sliced open at the wall height instead, as 0.3.0 did
+  everywhere.
 - The cut is level and takes everything above it: a creature taller than
   the wall height loses its top. Raise the wall height, or set it all the way
   up for walls to the ceiling.
 - A wall inside the room that stands between the camera and your character
   hides what is behind it, up to the wall height.
-- The cut needs the Direct3D 9 renderer (the default, and the one DXVK works
-  through). Without it the building is still shown from inside, but beams
-  and the floor upstairs stay in the picture.
+- The cut needs a Direct3D 9 renderer (`gxApi` d3d9, the default, or d3d9ex;
+  DXVK is one). With OpenGL the building is still shown from inside, but
+  beams and the floor upstairs stay in the picture.
+- With a fog mod that fogs the finished picture by depth, the black behind
+  the rooms takes on as much fog as the far end of the rooms themselves:
+  next to nothing in a house, a tint in a great hall. With CoAVolFog,
+  `InteriorDensity=0` in `CoAVolFog.ini` should take the rest away (going
+  by that file's own notes; not tried).
 - Expected, not yet seen: the name of a creature out in the street may still
   show over the black.
 
@@ -169,8 +181,11 @@ indoors" option then decides what happens under a roof.
 - `/arpg status` says whether the library loaded, which parts are working, in
   how many of the client's camera updates the lock was actually applied, and
   what the inside view is doing right now and why: how many rooms it shows,
-  whether it found a ceiling and at what height, where it cuts, and how many
-  frames it has drawn from inside a building.
+  whether it found a ceiling and at what height, where it cuts, how many
+  frames it has drawn from inside a building, and what the game has under
+  your feet (which part of which kind of building, and whether that counts
+  as indoors). If a place shows the wrong picture, that last line is the one
+  to send.
 - `WotLK-ARPG.log`, next to `Wow.exe`, is written at every start. It lists each
   place the library patched, or why it left one alone.
 - The library refuses to touch a client it does not recognise: every patch
@@ -189,13 +204,19 @@ indoors" option then decides what happens under a roof.
   library also patches, the library places its own hook in front of theirs
   where it can, and otherwise switches that one feature off and says so in
   the log.
+- **CoAVolFog** in particular: none of the places it checks or patches in
+  `Wow.exe` is touched (0.4.0 patched the client's fog routine, which
+  CoAVolFog patches too; 0.5.0 leaves it alone). The cut no longer changes
+  the depth the game draws with, which that mod's fog and water read. And
+  the plane the cut uses is switched off before the sun's glare, floating
+  text, names and the mod's own passes are drawn.
 
 ## Build and test
 
 ```
 client/build.sh       # build/WotLK-ARPG.dll and build/mock-client.exe (clang, lld; any OS)
 client/test/run.sh    # hook engine test, then the library against a mock client (Linux)
-python3 client/test/mutation_test.py            # breaks the cutaway 64 ways; the tests must notice each
+python3 client/test/mutation_test.py            # breaks the cutaway 115 ways; the tests must notice each
 python3 client/test/installer_test.py           # the setup script, on a made-up Wow.exe
 python3 client/tools/verify_sites.py Wow.exe    # your own Wow.exe against the patch sites
 tools/package.sh      # dist/WotLK-ARPG/: what gets installed
