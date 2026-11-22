@@ -1,16 +1,18 @@
 // WotLK-ARPG client library.
 //
-// What the Lua sandbox cannot do: move by holding the mouse button, and pin
-// the camera. The library keeps no settings of its own; the addon pushes them
-// in through the Lua functions registered at the bottom of this file, and
-// they are dropped again whenever the UI reloads.
+// What the Lua sandbox cannot do: move by holding the mouse button, pin the
+// camera, and take the roof off the building the character is in (that last
+// one is in cutaway.cpp). The library keeps no settings of its own; the addon
+// pushes them in through the Lua functions registered at the bottom of this
+// file, and they are dropped again whenever the UI reloads.
 
+#include "cutaway.h"
 #include "game.h"
 #include "hook.h"
 #include "log.h"
 #include "win.h"
 
-#define ARPG_VERSION "0.2.1"
+#define ARPG_VERSION "0.3.0"
 
 namespace {
 
@@ -22,6 +24,7 @@ enum Feature : uint32_t {
     kFeatureHoldMove = 2,
     kFeatureCameraAngles = 4,
     kFeatureCameraDistance = 8,
+    kFeatureCutaway = 16,
 };
 uint32_t g_features = 0;
 
@@ -455,6 +458,7 @@ void __cdecl OnLuaStateCreated() {
     g_ground.enabled = false;
     g_camera.locked = false;
     g_cameraStats = {0, 0, 0, 0};
+    cutaway::Reset();
 
     game::RegisterLuaFunction("ARPG_ClientVersion", LuaClientVersion);
     game::RegisterLuaFunction("ARPG_HoldStart", LuaHoldStart);
@@ -465,6 +469,8 @@ void __cdecl OnLuaStateCreated() {
     game::RegisterLuaFunction("ARPG_PlayerPosition", LuaPlayerPosition);
     game::RegisterLuaFunction("ARPG_SetCamera", LuaSetCamera);
     game::RegisterLuaFunction("ARPG_CameraInfo", LuaCameraInfo);
+    game::RegisterLuaFunction("ARPG_SetCutaway", cutaway::LuaSetCutaway);
+    game::RegisterLuaFunction("ARPG_CutawayInfo", cutaway::LuaCutawayInfo);
 }
 
 // ---------------------------------------------------------------------------
@@ -532,10 +538,14 @@ void Attach(void* self) {
         g_features |= kFeatureCameraDistance;
     }
 
+    if (cutaway::Install()) {
+        g_features |= kFeatureCutaway;
+    }
+
     const auto state = [](uint32_t feature) { return (g_features & feature) != 0 ? "on" : "OFF"; };
-    logfile::Write("Ready. Lua functions %s, hold-to-move %s, camera angles %s, camera distance %s.",
+    logfile::Write("Ready. Lua functions %s, hold-to-move %s, camera angles %s, camera distance %s, cutaway %s.",
                    state(kFeatureLua), state(kFeatureHoldMove), state(kFeatureCameraAngles),
-                   state(kFeatureCameraDistance));
+                   state(kFeatureCameraDistance), state(kFeatureCutaway));
 }
 
 }  // namespace

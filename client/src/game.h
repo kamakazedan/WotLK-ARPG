@@ -196,6 +196,183 @@ inline void BuildCameraMatrix(void* camera, float yaw, float pitch, float roll) 
 }
 
 // ---------------------------------------------------------------------------
+// The graphics device
+//
+// The engine keeps a view matrix and a projection matrix on the device.
+// Matrices are 4x4 floats, row-major, used with row vectors: a point becomes
+// p * view * projection. The projection the client builds for the world
+// (0x006BF370) is
+//     [ 1/(aspect*t)  0     0              0 ]
+//     [ 0             1/t   0              0 ]      t = tan(fov / 2)
+//     [ 0             0     (f+n)/(f-n)    1 ]      n, f = near and far distance
+//     [ 0             0     -2fn/(f-n)     0 ]
+// so view space has z pointing into the screen, clip-space w is that depth,
+// and clip-space z runs from -w at the near distance to +w at the far one.
+// ---------------------------------------------------------------------------
+
+struct Matrix {
+    float m[4][4];
+};
+
+constexpr uintptr_t kGxDevicePointer = 0x00C5DF88;  // CGxDevice*
+
+inline uint8_t* GxDevice() {
+    return *reinterpret_cast<uint8_t* const volatile*>(kGxDevicePointer);
+}
+
+constexpr size_t kGxDeviceProjection = 0x0F88;          // Matrix: as the engine set it
+constexpr size_t kGxDeviceHardwareProjection = 0x0FC8;  // Matrix: what the Direct3D device made of it
+constexpr size_t kGxDeviceViewLevel = 0x1AF8;           // uint32_t: top of the view matrix stack, 0 to 3
+constexpr size_t kGxDeviceViewStack = 0x1B00;           // Matrix[4]
+
+// Slot in the device's virtual table:
+// void __thiscall (const Matrix*). The Direct3D device (0x006A9B40) keeps the
+// matrix and derives the hardware one from it: depth is rescaled from -w..w
+// to Direct3D's 0..w by replacing m[2][2] with (m[2][2] + 1) / 2 and m[3][2]
+// with m[3][2] / 2 (it gets there by way of the near and far distances, and
+// divides by m[2][2] - 1 on the way). No other element changes.
+constexpr size_t kGxDeviceVirtualSetProjection = 40;
+
+inline void SetProjection(uint8_t* device, const Matrix* projection) {
+    void** virtuals = *reinterpret_cast<void***>(device);
+    reinterpret_cast<void (__thiscall*)(uint8_t*, const Matrix*)>(virtuals[kGxDeviceVirtualSetProjection])(
+        device, projection);
+}
+
+// void __cdecl (): hands the hardware projection to the vertex shaders. The
+// client calls it after every change of projection while drawing.
+constexpr uintptr_t kUpdateShaderProjection = 0x00872C10;
+
+inline void UpdateShaderProjection() {
+    reinterpret_cast<void (__cdecl*)()>(kUpdateShaderProjection)();
+}
+
+// ---------------------------------------------------------------------------
+// The world scene
+//
+// Once per frame the world frame updates the camera, sets the device's view
+// and projection from it (0x00607CB0), updates the scene (0x007831A0), draws
+// it (0x0079A870) and puts the device's matrices back (all from 0x004FAF90).
+//
+// Buildings, caves and dungeons are "map objects": a placed building has
+// groups (rooms and outer shells). Outdoor groups are drawn when they are in
+// view. Indoor groups are drawn only when the camera stands in one of them,
+// or sees into them through a doorway: the scene update finds the building
+// the camera is in, and the draw walks from there, or from the outdoor groups
+// in view, through the doorways. Every group reached is "visited", which
+// queues it, the scenery inside it and the creatures inside it for drawing.
+// ---------------------------------------------------------------------------
+
+constexpr uintptr_t kSceneCameraPosition = 0x00CD8F5C;  // Vec3: the camera position the scene is drawn from
+
+// What the scene update found the camera standing in.
+constexpr uintptr_t kSceneCameraBuilding = 0x00CD87A4;         // placed building, or null outdoors
+constexpr uintptr_t kSceneCameraBuildingSecond = 0x00CD87A0;   // a second one, where two overlap
+constexpr uintptr_t kSceneCameraGroupCount = 0x00CDB0D8;       // uint32_t: how many of its groups
+constexpr uintptr_t kSceneCameraGroupCountSecond = 0x00CDB0E8; // uint32_t
+constexpr uintptr_t kSceneCameraBuildingName = 0x00CD8628;     // char[]: its file name, for the client's diagnostics
+constexpr uintptr_t kSceneCameraGroupName = 0x00CD8730;        // char[]
+
+constexpr uintptr_t kSceneFrustumLevel = 0x00CD8798;  // int32_t: 0 while the view is the whole screen
+constexpr uintptr_t kSceneInteriorPath = 0x00CFBEB8;  // uint32_t: read by the visit routine, see below
+
+// Every placed building, as an intrusive list: the head, and where in each
+// building the link sits. A link's second word is the next building; the
+// list ends at a null or odd value.
+constexpr uintptr_t kPlacedBuildingsHead = 0x00D25440;
+constexpr uintptr_t kPlacedBuildingsLinkOffset = 0x00D25438;  // int32_t
+
+// A placed building.
+constexpr size_t kBuildingFlags = 0x0C;       // uint32_t
+constexpr size_t kBuildingBounds = 0x48;      // Box, world coordinates
+constexpr size_t kBuildingModel = 0xF4;       // the building's model, shared by every placement of it
+constexpr size_t kBuildingGroupLinkOffset = 0x114;  // int32_t: where in a group link its list link sits
+constexpr size_t kBuildingGroupLinks = 0x11C; // first group link; same list rules as above
+constexpr size_t kBuildingGroupArray = 0x120; // placed groups by index: four pointers here...
+constexpr size_t kBuildingGroupArrayCount = 0x124;  // ...or, if the mode below is -1, a count...
+constexpr size_t kBuildingGroupArrayData = 0x128;   // ...and a pointer to that many pointers
+constexpr size_t kBuildingGroupArrayMode = 0x130;   // int32_t: how many of the four are used, or -1
+constexpr uint32_t kBuildingFlagGroupsPlaced = 0x80;
+
+constexpr size_t kGroupLinkGroup = 0x04;  // in a group link: the placed group
+
+// A placed group.
+constexpr size_t kPlacedGroupBounds = 0x24;  // Box, world coordinates
+constexpr size_t kPlacedGroupIndex = 0x50;   // uint32_t: which of the model's groups
+
+// A building's model.
+constexpr size_t kModelGroupInfo = 0x130;   // array of 0x20-byte records, one per group, flags first
+constexpr size_t kModelGroupCount = 0x16C;  // uint32_t
+constexpr size_t kModelLoaded = 0x1E0;      // uint32_t: nonzero once the model file is in
+constexpr size_t kModelGroups = 0x1F8;      // array of pointers to the groups' own data
+constexpr size_t kModelGroupInfoSize = 0x20;
+
+constexpr size_t kGroupDataLoadFlags = 0x198;  // uint32_t, in a group's own data
+constexpr uint32_t kGroupDataLoaded = 0x1;
+
+// Group flags, from the model file.
+constexpr uint32_t kGroupFlagOutdoor = 0x8;             // drawn with the outdoor world
+constexpr uint32_t kGroupFlagOutdoorLit = 0x40;         // indoors, but lit by the sky
+constexpr uint32_t kGroupFlagAlwaysOutdoor = 0x10000;   // has no doorways; treated like an outdoor group
+
+struct Box {
+    Vec3 low;
+    Vec3 high;
+};
+
+// void __cdecl (uint32_t groupIndex, void* building): the visit. Queues the
+// placed group for drawing with the view currently on top of the scene's
+// stack of views. The group must be placed and its data loaded: the routine
+// does not check. It reads kSceneInteriorPath: nonzero marks the group as
+// reached through indoor rooms only, which spares the creatures in it the
+// test against the terrain's horizon.
+constexpr uintptr_t kVisitBuildingGroup = 0x00799310;
+
+inline void VisitBuildingGroup(uint32_t groupIndex, void* building) {
+    reinterpret_cast<void (__cdecl*)(uint32_t, void*)>(kVisitBuildingGroup)(groupIndex, building);
+}
+
+// int __cdecl (const Box*): nonzero if the box lies wholly outside the view
+// on top of the scene's stack.
+constexpr uintptr_t kBoxOutsideView = 0x0078FB20;
+
+inline bool BoxOutsideView(const Box* box) {
+    return reinterpret_cast<int (__cdecl*)(const Box*)>(kBoxOutsideView)(box) != 0;
+}
+
+// bool __cdecl (const Vec3* from, const Vec3* to, Vec3* hit, float* fraction,
+// uint32_t flags, uint32_t zero): whether the line meets the world, and where
+// first. `fraction` goes in as 1 and comes back as how far along the line
+// the hit is.
+constexpr uintptr_t kIntersectWorld = 0x0077F310;
+
+// What the line is tested against (0x007A3B70 decides from the flags):
+//   0x10, 0x20, 0x40   the surfaces of buildings. 0x007AE140 turns the three
+//                      into a mask of surface kinds: those that block
+//                      movement, those that are drawn, and with 0x40 not
+//                      those marked as letting the camera through.
+//   0x100, and others  the terrain, by a second routine (0x007A39F0) that
+//                      none of the three bits above brings in.
+//   0x1, 0x100000, ... models and game objects (anything in 0x40F0000F).
+// The client's own camera collision (0x00605D60) uses 0x00100171. Buildings
+// alone, as the camera sees them:
+constexpr uint32_t kIntersectBuildings = 0x00000070;
+
+inline bool IntersectWorld(const Vec3& from, const Vec3& to, Vec3* hit, float* fraction, uint32_t flags) {
+    *fraction = 1.0f;
+    return reinterpret_cast<bool (__cdecl*)(const Vec3*, const Vec3*, Vec3*, float*, uint32_t, uint32_t)>(
+        kIntersectWorld)(&from, &to, hit, fraction, flags, 0);
+}
+
+// bool __thiscall CGUnit(): whether the unit is outdoors; the client's
+// IsIndoors() and IsOutdoors() are this test on the player (0x00612300).
+constexpr uintptr_t kUnitIsOutdoors = 0x0071B7F0;
+
+inline bool UnitIsOutdoors(void* unit) {
+    return reinterpret_cast<bool (__thiscall*)(void*)>(kUnitIsOutdoors)(unit);
+}
+
+// ---------------------------------------------------------------------------
 // Lua
 // ---------------------------------------------------------------------------
 
@@ -274,5 +451,29 @@ constexpr uint8_t kCameraCollisionBytes[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x48}
 constexpr uintptr_t kLuaRegistrationReturn = 0x00530F85;
 constexpr uint8_t kLuaRegistrationReturnBytes[] = {0xC3, 0xCC, 0xCC, 0xCC, 0xCC};
 constexpr size_t kLuaRegistrationLength = 0x25;  // bytes from the routine's start to that ret
+
+// The rest are `call` instructions inside larger routines, redirected.
+
+// In the scene update: void __cdecl (), finds the building the camera is in
+// (0x00795D40) and fills in the kSceneCamera... values.
+constexpr uintptr_t kLocateCameraCall = 0x00783381;
+constexpr uint8_t kLocateCameraCallBytes[] = {0xE8, 0xBA, 0x29, 0x01, 0x00};
+
+// In the scene draw, back to back once everything in view has been found:
+// void __cdecl () (0x0079A260), which goes through the visited groups for
+// the scenery and creatures in them, and void __cdecl () (0x00793450), the
+// last step before anything is drawn.
+constexpr uintptr_t kFinishVisitsCall = 0x0079AB2A;
+constexpr uint8_t kFinishVisitsCallBytes[] = {0xE8, 0x31, 0xF7, 0xFF, 0xFF};
+constexpr uintptr_t kBeforeDrawingCall = 0x0079AB2F;
+constexpr uint8_t kBeforeDrawingCallBytes[] = {0xE8, 0x1C, 0x89, 0xFF, 0xFF};
+
+// In the cursor's hit test (0x004F9DA0), which first sets the device's
+// projection afresh from the camera:
+// int __thiscall CGWorldFrame(float x, float y, Vec3* start, Vec3* end)
+// (0x004F6450), the cursor's ray from the near to the far end of the view;
+// returns 0 if the cursor is not over the world.
+constexpr uintptr_t kCursorRayCall = 0x004F9EC1;
+constexpr uint8_t kCursorRayCallBytes[] = {0xE8, 0x8A, 0xC5, 0xFF, 0xFF};
 
 }  // namespace game

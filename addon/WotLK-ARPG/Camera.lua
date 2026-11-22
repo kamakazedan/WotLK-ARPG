@@ -3,7 +3,8 @@
 
     With the client library the camera is locked to a set direction, angle
     and distance (ARPG_SetCamera), and nothing the mouse or the game does can
-    move it. Without the library the camera can only be "parked": it stops
+    move it; indoors the library takes the roof off (ARPG_SetCutaway, see
+    Core.lua). Without the library the camera can only be "parked": it stops
     following the character, its zoom keys are disabled and a saved view is
     restored, but dragging the mouse still turns it.
 ]]
@@ -43,8 +44,8 @@ local function setCVar(name, value)
 end
 
 function ns:ApplyCVars()
-    local db = self.db
-    db.savedCVars = db.savedCVars or {}
+    local db, char = self.db, self.char
+    char.savedCVars = char.savedCVars or {}
     for _, entry in ipairs(CVARS) do
         local name, wanted, setting = entry[1], entry[2], entry[3]
         local current = getCVar(name)
@@ -52,15 +53,15 @@ function ns:ApplyCVars()
             -- this client has no such CVar
         elseif setting and not db[setting] then
             -- Switched off in the settings: give the player's own value back.
-            if db.savedCVars[name] ~= nil then
-                setCVar(name, db.savedCVars[name])
-                db.savedCVars[name] = nil
+            if char.savedCVars[name] ~= nil then
+                setCVar(name, char.savedCVars[name])
+                char.savedCVars[name] = nil
             end
         else
             -- Snapshot once, so a later login cannot overwrite the player's
             -- real setting with the value the mode itself wrote.
-            if db.savedCVars[name] == nil then
-                db.savedCVars[name] = current
+            if char.savedCVars[name] == nil then
+                char.savedCVars[name] = current
             end
             if current ~= wanted then
                 setCVar(name, wanted)
@@ -70,22 +71,24 @@ function ns:ApplyCVars()
 end
 
 function ns:RestoreCVars()
-    local saved = self.db.savedCVars
+    local saved = self.char.savedCVars
     if not saved then return end
     for name, value in pairs(saved) do
         setCVar(name, value)
     end
-    self.db.savedCVars = nil
+    self.char.savedCVars = nil
 end
 
 ---------------------------------------------------------------------------
 -- Locked camera (client library)
 ---------------------------------------------------------------------------
 
--- Until buildings can be cut away, an indoor camera that ignores walls would
--- sit above the roof looking at tiles. Indoors it may collide instead.
+-- An indoor camera that ignores walls sits above the roof looking at tiles.
+-- The cutaway takes the roof off. Where there is no cutaway (switched off,
+-- an older library, a renderer it cannot work with), the camera may collide
+-- indoors instead, which keeps the character in view by moving in.
 function ns:WantsCollision()
-    return (self.db.indoorCollision and IsIndoors()) and true or false
+    return (self.db.indoorCollision and IsIndoors() and not self:CutawayWorks()) and true or false
 end
 
 -- Locks or releases the camera to match the settings. Safe to call at any
@@ -117,7 +120,7 @@ function ns:ApplyCamera(verbose)
         end
         return
     end
-    if not self.db.hasView then
+    if not self.char.hasView then
         if verbose then
             ns.Print("No camera saved yet: /arpg camedit, set it up, then /arpg savecam.")
         end
@@ -133,7 +136,7 @@ function ns:SaveCamera()
         return
     end
     SaveView(self.VIEW_SLOT)
-    self.db.hasView = true
+    self.char.hasView = true
     ns.Print("Camera saved. /arpg cam snaps back to it at any time.")
     if self.cameraEdit then
         self:SetCameraEdit(false)

@@ -23,17 +23,24 @@ Install
    Your Wow.exe must already have that loader: St0ny's AIO patcher adds it
    (patch "Load AwesomeWotlkLib.dll at startup"), as does awesome_wotlk's own
    patcher. The script tells you if it is missing.
-4. Start the game, log in, type /arpg.
+4. Start the game and log in. The mode is on from the first login.
+
+To update, close the game and copy the new files over the old ones. There is
+no need to run the Install script again.
 
 In game
 -------
   /arpg            turn the mode on or off
-  /arpg options    camera angle, distance and facing
+  /arpg options    camera, roofs, clicks and sound
+  /arpg cut        roofs off indoors, on or off
   /arpg status     what is on, and whether the library is working
   /arpg help       everything else
 
 Hold the left mouse button to move. Click a creature, object or corpse to walk
-up and interact, attack or loot.
+up and interact, attack or loot. Indoors the roof and the upper floors are
+left out, so you look into the room from above.
+
+Nothing here uses or changes any other addon.
 
 If something is off
 -------------------

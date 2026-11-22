@@ -4,8 +4,9 @@
 // machine code does not care which program it is in. This test compiles the
 // real hook.cpp for Linux x86-64, points it at small hand-assembled functions
 // and then calls them, covering: a hook over stock bytes, a refusal on
-// unexpected bytes, a hook in front of another library's hook, and the
-// call-before-return patch in both its plain and chained form.
+// unexpected bytes, a hook in front of another library's hook, the
+// call-before-return patch in both its plain and chained form, and the
+// redirect of a call instruction.
 //
 // Build and run with test/run.sh. Linux x86-64 only.
 
@@ -195,6 +196,79 @@ void TestCallBeforeReturn() {
     Check(value == 99, "and the other library's tail still runs afterwards");
 }
 
+IntFunction g_originalCallee = nullptr;
+int RedirectHook() { return g_originalCallee() + 100; }
+IntFunction g_foreignCallee = nullptr;
+int ForeignRedirect() { return g_foreignCallee() * 2; }
+
+// sub rsp,8; call <target>; add rsp,8; ret. The call is at offset 4.
+constexpr size_t kCallOffset = 4;
+
+uint8_t* MakeCaller(uint8_t* target) {
+    uint8_t* code = static_cast<uint8_t*>(LowPages(4096));
+    const uint8_t enter[] = {0x48, 0x83, 0xEC, 0x08};
+    const uint8_t leave[] = {0x48, 0x83, 0xC4, 0x08, 0xC3};
+    memcpy(code, enter, sizeof(enter));
+    hook::EmitRelative(code + kCallOffset, 0xE8, reinterpret_cast<uintptr_t>(code + kCallOffset),
+                       reinterpret_cast<uintptr_t>(target));
+    memcpy(code + kCallOffset + 5, leave, sizeof(leave));
+    return code;
+}
+
+void TestRedirectCall() {
+    printf("redirecting a call\n");
+    uint8_t* callee = MakeFunction(5);
+    uint8_t* caller = MakeCaller(callee);
+    IntFunction function = reinterpret_cast<IntFunction>(caller);
+    Check(function() == 5, "the caller works before hooking");
+
+    uint8_t stock[5];
+    memcpy(stock, caller + kCallOffset, sizeof(stock));
+    const hook::Site site = {"call", reinterpret_cast<uintptr_t>(caller + kCallOffset), stock, sizeof(stock), 0};
+    hook::Result result = hook::RedirectCall(site, reinterpret_cast<void*>(RedirectHook),
+                                             reinterpret_cast<void**>(&g_originalCallee));
+    Check(result == hook::Result::kInstalled, "reports installed");
+    Check(reinterpret_cast<uint8_t*>(g_originalCallee) == callee, "the original is the routine the call went to");
+    Check(caller[kCallOffset] == 0xE8 && caller[kCallOffset + 5] == 0x48, "only the call instruction changed");
+    Check(function() == 105, "the hook runs and can still call the original");
+
+    // Another library already sends the call somewhere else.
+    uint8_t* chained = MakeCaller(callee);
+    g_foreignCallee = reinterpret_cast<IntFunction>(callee);
+    hook::EmitRelative(chained + kCallOffset, 0xE8, reinterpret_cast<uintptr_t>(chained + kCallOffset),
+                       reinterpret_cast<uintptr_t>(ForeignRedirect));
+    Check(reinterpret_cast<IntFunction>(chained)() == 10, "the other library's redirect works on its own (5 * 2)");
+    uint8_t stockChained[5];
+    hook::EmitRelative(stockChained, 0xE8, reinterpret_cast<uintptr_t>(chained + kCallOffset),
+                       reinterpret_cast<uintptr_t>(callee));
+    const hook::Site chainedSite = {"chained call", reinterpret_cast<uintptr_t>(chained + kCallOffset), stockChained,
+                                    sizeof(stockChained), 0};
+    result = hook::RedirectCall(chainedSite, reinterpret_cast<void*>(RedirectHook),
+                                reinterpret_cast<void**>(&g_originalCallee));
+    Check(result == hook::Result::kChained, "reports chained");
+    Check(reinterpret_cast<IntFunction>(chained)() == 110, "both run: (5 * 2) + 100");
+
+    // Not a call at all any more.
+    uint8_t* strange = MakeCaller(callee);
+    memset(strange + kCallOffset, 0x90, 5);
+    uint8_t before[16];
+    memcpy(before, strange, sizeof(before));
+    void* original = reinterpret_cast<void*>(static_cast<uintptr_t>(0x1234));
+    const hook::Site strangeSite = {"strange call", reinterpret_cast<uintptr_t>(strange + kCallOffset), stockChained,
+                                    sizeof(stockChained), 0};
+    const int protectBefore = g_protectCalls;
+    result = hook::RedirectCall(strangeSite, reinterpret_cast<void*>(RedirectHook), &original);
+    Check(result == hook::Result::kMismatch, "anything but a call is a mismatch");
+    Check(memcmp(before, strange, sizeof(before)) == 0 && g_protectCalls == protectBefore, "and nothing was written");
+    Check(original == reinterpret_cast<void*>(static_cast<uintptr_t>(0x1234)), "nor the original touched");
+
+    const uint8_t notACall[] = {0x90, 0x90, 0x90, 0x90, 0x90};
+    const hook::Site badSite = {"bad definition", reinterpret_cast<uintptr_t>(strange + kCallOffset), notACall,
+                                sizeof(notACall), 0};
+    Check(hook::RedirectCall(badSite, reinterpret_cast<void*>(RedirectHook), &original) == hook::Result::kFailed,
+          "a site whose expected bytes are not a call is refused outright");
+}
+
 void TestBackwardJumpTarget() {
     printf("jump decoding\n");
     uint8_t* code = static_cast<uint8_t*>(LowPages(8192));
@@ -212,6 +286,7 @@ int main() {
     TestMismatch();
     TestChainedDetour();
     TestCallBeforeReturn();
+    TestRedirectCall();
     TestBackwardJumpTarget();
     printf(g_failures == 0 ? "\nall hook engine checks passed\n" : "\n%d hook engine checks FAILED\n", g_failures);
     return g_failures == 0 ? 0 : 1;
