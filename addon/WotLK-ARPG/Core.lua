@@ -68,6 +68,7 @@ ns.FEATURE_CAMERA_ANGLES = 4
 ns.FEATURE_CAMERA_DISTANCE = 8
 ns.FEATURE_CUTAWAY = 16     -- up to library 0.3.0 this alone: the world cut open, outdoors and all
 ns.FEATURE_INSIDE_VIEW = 32 -- from 0.4.0: buildings shown from inside
+ns.FEATURE_ROOMS = 64       -- from 0.5.0: rooms told from streets; ARPG_CutawayInfo says what was found
 
 function ns:HasClient()
     return type(ARPG_ClientVersion) == "function"
@@ -128,13 +129,13 @@ function ns:ApplyGroundClicks()
 end
 
 -- The inside view (the "cutaway" of the settings and of the library's
--- function names): while the character is in a building, the library shows
--- the building from inside, looked into from above, with nothing of the
--- outdoor world, and cuts off whatever is higher than a set height. The
--- library decides frame by frame what there is to do; this only says whether
--- it may.
+-- function names): while the character is in a room, the library shows the
+-- building from inside, looked into from above, with nothing of the outdoor
+-- world, and cuts off whatever is higher than a set height. "In a room" is
+-- wherever the game itself has the character indoors. The library decides
+-- frame by frame what there is to do; this only says whether it may.
 function ns:ClientCanCutAway()
-    return self:ClientHas(self.FEATURE_INSIDE_VIEW)
+    return self:ClientHas(self.FEATURE_ROOMS)
 end
 
 function ns:CutawayWanted()
@@ -395,7 +396,7 @@ function ns:PrintCutawayProof()
     local db = self.db
     local fallback = db.indoorCollision and "the camera moves in when a wall is in the way" or "the camera stays put"
     if not self:ClientCanCutAway() then
-        ns.Print(format("Indoors: %s. (No inside view: it needs client library 0.4.0 or later with all its "
+        ns.Print(format("Indoors: %s. (No inside view: it needs client library 0.5.0 or later with all its "
             .. "hooks in.)", fallback))
         return
     end
@@ -404,7 +405,7 @@ function ns:PrintCutawayProof()
         return
     end
     local asked, cutting, height, frames, cut, skipped, rooms, indoors, _, refused, overhead, between, inside,
-        insideFrames = ARPG_CutawayInfo()
+        insideFrames, draws, group, groupFlags, area, doorsOut = ARPG_CutawayInfo()
     if asked ~= 1 then
         ns.Print("Inside view: not in use at the moment.")
         return
@@ -415,8 +416,8 @@ function ns:PrintCutawayProof()
         ns.Print(format("Inside view: %d room%s shown from inside, %s, %s.", rooms, rooms == 1 and "" or "s",
             ceiling, cutText))
     elseif indoors == 1 then
-        -- The client says the character is indoors, but its own lookup of
-        -- the room under the character came back empty.
+        -- The game says the character is indoors, but its lookup of the
+        -- room under the character came back empty or with no room.
         ns.Print(format("|cffffd200Inside view: this building is not found from inside|r, so the world is "
             .. "drawn, sliced open (%s, %s, %s, %d rooms).", ceiling, (between or 0) > 0
             and format("line of sight blocked %.1f yd up", between) or "line of sight clear", cutText, rooms))
@@ -425,6 +426,17 @@ function ns:PrintCutawayProof()
     else
         ns.Print("Inside view: on. You are outdoors, and nothing is cut.")
     end
+    -- What the game has under the character's feet: the numbers to send
+    -- along when a place shows the wrong picture.
+    if (group or -1) < 0 then
+        ns.Print("  Under your feet: open ground, or the outside of a building.")
+    else
+        ns.Print(format("  Under your feet: part %d of a building (flags %X, area %s), which the game counts as %s.%s",
+            group, bit.band(groupFlags or 0, 0x7FFFFFFF), (area or -1) < 0 and "none" or format("%X", area),
+            inside == 1 and "indoors" or "outdoors",
+            (inside == 1 and (doorsOut or 0) > 0) and format(" %d way%s out not shown.", doorsOut,
+                doorsOut == 1 and "" or "s") or ""))
+    end
     if refused == 1 then
         ns.Print("|cffff2020The game's renderer does not take the cut|r (it needs Direct3D 9): beams and the "
             .. "floor upstairs stay in the picture. Please send WotLK-ARPG.log.")
@@ -432,8 +444,9 @@ function ns:PrintCutawayProof()
         ns.Print(format("|cffff2020The cut is asked for but is not taking effect|r (%d frames, %d skipped). "
             .. "Please send this line and WotLK-ARPG.log.", frames, skipped))
     end
-    ns.Print(format("  Since the UI loaded: %d frames, %d drawn from inside a building, %d cut%s.", frames,
-        insideFrames or 0, cut, skipped > 0 and format(" (%d skipped)", skipped) or ""))
+    ns.Print(format("  Since the UI loaded: %d frames, %d drawn from inside a building, %d cut%s%s.", frames,
+        insideFrames or 0, cut, (draws or 0) > 0 and format(" (%d draws in the last)", draws) or "",
+        skipped > 0 and format(", %d skipped", skipped) or ""))
 end
 
 function ns:PrintHelp()
@@ -519,14 +532,14 @@ function ns:SetCutaway(text)
     self:ApplyCutaway()
     self:ApplyClientCamera()
     if db.cutaway then
-        ns.Print(format("Inside view on: under a roof you see only the inside of the building, up to %d yards "
+        ns.Print(format("Inside view on: indoors you see only the inside of the building, up to %d yards "
             .. "above your feet.%s", db.cutawayHeight, db.cutawayOutdoors
             and " Outdoors, the world is sliced while a building hides your character." or ""))
     else
         ns.Print("Inside view off: buildings are drawn whole.")
     end
     if not self:ClientCanCutAway() then
-        ns.Print("This needs the client library (0.4.0 or later), which is not loaded.")
+        ns.Print("This needs the client library (0.5.0 or later), which is not loaded.")
     elseif not db.enabled then
         ns.Print("It takes effect while the mode is on (/arpg).")
     end

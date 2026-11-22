@@ -19,8 +19,12 @@ privately run AzerothCore server.
 All six are built. For 4, cutting the whole world open (0.3.0) worked in the
 game but showed too much: hollow buildings, the bare ground under a city.
 What was asked for after seeing it is the building from inside and nothing
-else, on black (0.4.0, not yet through the game). Added since, from playing
-it:
+else, on black (0.4.0). In the game that gave clean rooms, and also city
+streets taken for rooms, rooms missing next door, and a band of a fog mod's
+fog across the screen. 0.5.0 goes by the game's own rule for what is indoors,
+finds the rooms through the doorways itself, and cuts with a clip plane
+instead of through the projection (not yet through the game). Added since,
+from playing it:
 
 7. Move clicks stay at ground level: a click on a roof or a treetop goes to
    the ground under the cursor. (Built.)
@@ -137,7 +141,7 @@ Rules for addon work:
 
 ## Client library
 
-`client/src`, about 2,600 lines of C++ with no dependencies: no Windows SDK, no
+`client/src`, about 3,000 lines of C++ with no dependencies: no Windows SDK, no
 C runtime, imports from `kernel32.dll` only. `client/build.sh` builds it with
 clang and lld on any OS.
 
@@ -192,7 +196,7 @@ AIO patcher or awesome_wotlk's patcher first.
 
 | Lua global | Purpose |
 |---|---|
-| `version, features = ARPG_ClientVersion()` | Its presence is how the addon detects the library. `features` is a bit set of the hooks that went in: 1 Lua functions, 2 hold-to-move, 4 camera angles, 8 camera distance, 16 the cutaway (all its hooks), 32 the cutaway shows buildings from inside (0.4.0; set together with 16) |
+| `version, features = ARPG_ClientVersion()` | Its presence is how the addon detects the library. `features` is a bit set of the hooks that went in: 1 Lua functions, 2 hold-to-move, 4 camera angles, 8 camera distance, 16 the cutaway (all its hooks), 32 the cutaway shows buildings from inside (0.4.0), 64 it tells rooms from streets and reports what it found (0.5.0); the three are set together |
 | `ARPG_HoldStart()` / `ARPG_HoldStop()` | The move button went down / came up |
 | `ARPG_SetHoldInterval(ms)` | How often a held button re-issues the move (default 100, limits 10 to 2000) |
 | `ARPG_SetGroundClicks(maxRise)` | Move clicks that land more than `maxRise` yards above the character's feet go to the ground under the cursor. No argument: off |
@@ -201,8 +205,8 @@ AIO patcher or awesome_wotlk's patcher first.
 | `ARPG_SetCamera(yawDeg, pitchDeg, distance [, collide])` | Lock the camera. Yaw 0 looks north, positive turns counter-clockwise; pitch is degrees below the horizon (limit 89); distance in yards (2 to 200); `collide` lets walls shorten the distance |
 | `ARPG_SetCamera()` | Release the camera |
 | `asked, angleRuns, angleLocked, distanceRuns, distanceLocked = ARPG_CameraInfo()` | Whether a lock is asked for, how often the client has run its two camera routines since the UI loaded, and in how many of those runs the lock was applied. `/arpg status` shows it: a lock that is asked for but never applied is a bug |
-| `ARPG_SetCutaway(height [, outdoors])` | While the character is in a building, show the building from inside and nothing else, with whatever is more than `height` yards (2 to 30) above the character's feet left out. With `outdoors` true, also cut the world open wherever a building hides the character from the camera under the open sky. No argument: off |
-| `asked, cutting, height, frames, framesCut, framesSkipped, rooms, indoors, blocked, refused, overhead, between, inside, framesInside = ARPG_CutawayInfo()` | What the cutaway is doing: whether a cut is on and how far above the feet; scene updates seen, drawn cut, and skipped because the device's matrices were not as expected; rooms drawn in the last frame; whether the character is in a building (found there by the scene, or so says the client's indoors test); whether a building blocks the view in the open; whether the cut has been given up because the renderer does not keep its projection; how far overhead, and how high between camera and character, the building is (0 for none); whether the last frame was drawn from the character's room; and how many frames have been. `/arpg status` shows it |
+| `ARPG_SetCutaway(height [, outdoors])` | While the character is in a room, show the building from inside and nothing else, with whatever is more than `height` yards (2 to 30) above the character's feet left out. With `outdoors` true, also cut the world open wherever a building hides the character from the camera under the open sky. No argument: off |
+| `asked, cutting, height, frames, framesCut, framesSkipped, rooms, indoors, blocked, refused, overhead, between, inside, framesInside, draws, group, groupFlags, area, doorsOut = ARPG_CutawayInfo()` | What the cutaway is doing: whether a cut is on and how far above the feet; scene updates seen, drawn cut, and skipped because the device or its matrices were not as expected; rooms drawn in the last frame; whether the character is in a building (in a room the scene found, or so says the client's indoors test); whether a building blocks the view in the open; whether the cut has been given up because Direct3D refuses its clip plane; how far overhead, and how high between camera and character, the building is (0 for none); whether the last frame was drawn from the character's room; how many frames have been; how many draws of the last cut frame were made with the plane on; the building group under the character (-1 for none), its flags and the area table's flags for it (-1 for no record); and how many places beyond doorways were left out of the last inside frame as not being rooms. The first fourteen are as in 0.4.0. `/arpg status` shows it |
 
 Functions added after 0.2.0 are detected by their presence, not by a feature
 bit.
@@ -284,61 +288,96 @@ looked into from above, and nothing else.
 
 The client can already draw that picture, and in a few buildings it does so
 by accident (the Stormwind bank is one). When it takes the camera to be
-inside a building it draws from the camera's room outwards through the
-doorways (`0x007B3B20`, which judges each doorway with `0x007AD1F0`), and
-draws the outdoor world only as far as that walk came across doorways and
-windows to it. And the walls and ceilings of rooms are made to be seen from
-inside only, so a camera that is really above the roof looks straight
-through the roof and the near walls at the room. What "inside a building"
-means is a line straight down from the camera (`0x00795D40` asks
-`0x007D59B0`): if the first building surface under the camera belongs to an
-indoor group, the camera is in that group. Over the bank that is the bank's
-own ceiling. Over most buildings it is a roof that belongs to the outdoors,
-and the client draws the world as usual. Six redirected calls and one detour
-make the accident the rule wherever the character is in a room:
+inside a building it draws the camera's room and what its doorways lead to
+(`0x007B3B20`), and draws the outdoor world only as far as that walk came
+across doorways and windows to it. And the walls and ceilings of rooms are
+made to be seen from inside only, so a camera that is really above the roof
+looks straight through the roof and the near walls at the room. What "inside
+a building" means is a line straight down from the camera (`0x00795D40`): as
+far down as the terrain (`0x007A39F0`), the first building surface it meets
+(`0x007D59B0`) names the group the camera is in, unless that group has the
+outdoor flag. Over the bank that is the bank's own ceiling. Over most
+buildings it is a roof that belongs to the outdoors, and the client draws
+the world as usual. Nine redirected calls make the accident the rule
+wherever the character is in a room:
 
-- *The room.* For the length of the one call that finds the camera's
-  building (`0x00783381`), the scene's camera position (`0x00CD8F5C`), which
-  that routine reads once at its start, holds the character's chest instead.
-  The answer is the room the character is in, or none under the open sky,
-  even while the camera itself hangs inside somebody's attic. The walk
-  through the doorways afterwards still judges each doorway from where the
-  camera really is, which leaves out the rooms between camera and character.
-- *Nothing else.* The walk leaves behind two rectangles of the screen
-  (`0x00ADF570`, `0x00ADF58C`) through which the sky and the outdoor world
-  show. Right after the walk (the call at `0x0079AA2C`) both are emptied the
-  way the client itself empties them, so it draws no sky and skips the
-  outdoor world. The screen is cleared to black (the call at `0x0079AB9A`).
-  Fog (`0x00873210`) would fade far walls to the colour of a sky that is not
-  there, starting from a camera that is a long way off: it fades to black,
-  and starts as far beyond the character as it would have beyond the camera.
-  The fog is a detour of its own and a matter of looks only.
-- *The rooms' contents.* The client shows the furniture and people of a room
-  next door only as far as its doorway frames them. Each group the walk
-  queued (`+0xB4` of the placed group) is visited once more (`0x00799310`)
-  with the whole screen as its frame, just before the client goes through
-  the visited groups (`0x0079AB2A`). A group already queued is not queued
-  twice; it only gains the second frame.
+- *Which room.* The library asks the client's two questions itself, from the
+  character's chest. If the answer is a room, then for the length of the one
+  call that finds the camera's building (`0x00783381`) the scene's camera
+  position (`0x00CD8F5C`), which that routine reads once at its start, holds
+  the character's chest, and the scene is drawn from that room, even while
+  the camera itself hangs above the roof.
+- *What a room is.* Not every group without the outdoor flag: 0.4.0 took it
+  so, and the first test in the game showed Stormwind's streets, bridges and
+  porches drawn "from inside", terrain and water gone and the wall height
+  cutting the city. Those are groups of the city's model like any room, with
+  doorways between them, only without a ceiling. The client's own answer to
+  "is this outdoors" (`0x0077FBF0`, which is behind `IsIndoors()` and where
+  one may ride) asks WMOAreaTable.dbc first (`0x00990560`, by the model's
+  number, the placement's name set and the group's own number): flag 4 says
+  outdoors, flag 2 says indoors, and only without either does the group's
+  flag decide. The library asks the same of the group it found, and a room
+  is a group that comes out indoors. A group the client draws whenever it is
+  in view (flag `0x10000`) is none either.
+- *The rooms.* The client's walk (`0x007AD1F0`, `0x007AC060`) is a search
+  for what the camera can see: it does not go through a doorway whose far
+  side the camera is on, and shows a room beyond a doorway only as far as
+  the doorway frames it. From a camera that is not in the room at all that
+  left rooms out and showed others in part (0.4.0 widened the frames
+  afterwards, but could not bring back what the walk had not reached). The
+  walk is not made. In its place (the call at `0x0079AA2C`) every group that
+  can be reached from the character's through doorways is found, from the
+  doorway lists in the model (`+0x13C`, eight bytes a doorway; each group
+  has its run of them at `+0x50`, `+0x54`). A group that counts as outdoors
+  is neither shown nor gone through, so the street is not drawn and neither
+  is the house across it. Each room that is in view and not wholly above the
+  cut is visited (`0x00799310`) under the whole-screen view, which queues
+  it, its furniture and, when the client next deals them out
+  (`0x00799F80`), the creatures in it.
+- *Nothing else.* It is the walk that opens the window onto the outdoor
+  world (`0x00ADF58C`), so that stays shut; the window onto the sky
+  (`0x00ADF570`), which the client's lookup opens by itself for some rooms,
+  is shut the way the client shuts it. The client then draws no sky and
+  skips the outdoor world. The screen is cleared to black (the call at
+  `0x0079AB9A`).
+- *Behind the rooms.* The client clears depth to the far end of the view. A
+  shader that fogs the finished picture by depth (CoAVolFog does) finds open
+  sky there and fills the black with fog. So in the inside view depth is
+  cleared once more, by Direct3D's own `Clear`, to the depth of a wall two
+  yards behind the farthest corner of the rooms drawn: nothing drawn lies
+  beyond it, and what a fog shader finds is a dark wall at room distance.
 - *The cut.* Beams, galleries and the floor of the storey above are solid
-  and face the camera. Everything above a level plane is clipped by making
-  that plane the near side of the view (Lengyel's oblique near-plane
-  projection). With the plane as `P` in view space (the world's downward
-  direction turned by the view matrix, and the plane's height less the
-  camera's), the depth column of the projection becomes `s*P - (0, 0, 1, 0)`,
-  where `s` is chosen so that the far corner of the view on the plane's side
-  keeps its depth. x, y and w come out as before, so nothing moves on
-  screen. The Direct3D device turns the engine's depth range of -w..w into
-  0..w when it takes a projection (`0x006A9B40`); it does so by halving two
-  of the four terms and leaving the other two alone, so those two go in
-  already halved, and the library reads the hardware matrix back to see that
-  the result is half the scaled plane. The swap is made at `0x0079AB2F`, the
-  last step before drawing: the client decides what is in view from the
-  corners of the view volume, which an oblique projection would wreck, so it
-  must not see the changed matrix before then. The shaders are handed the
-  new matrix (`0x00872C10`); the model renderer sets itself up after that
-  point and takes the device's projection as it finds it, so models are cut
-  at the same plane with the same depth. The client's own restore at the end
-  of the frame undoes the swap. This part ran in the game in 0.3.0.
+  and face the camera. Everything above a level plane is clipped while the
+  world is drawn. Up to 0.4.0 the plane took the place of the near side of
+  the view (an oblique projection). That clips everything and moves nothing,
+  but it changes what depth means, and the same fog shader, reading depth as
+  distance, drew a band of fog across the screen wherever the plane was
+  close under the camera. Since 0.5.0 the plane is a user clip plane and the
+  projection is not touched. With `P` the plane in view space (the world's
+  downward direction turned by the view matrix, and the plane's height less
+  the camera's) and `m` the hardware projection, the plane in clip space,
+  where Direct3D wants it for a draw with a vertex shader, is
+  `(P.x / m00, P.y / m11, P.w / m32, P.z - m22 * P.w / m32)`: dotted with a
+  vertex as it leaves the shader, that is `P` dotted with the vertex in view
+  space again. It goes to Direct3D as plane 5 (`SetClipPlane`; the client
+  uses plane 0 for a few models) at `0x0079AB2F`, the last step before
+  drawing. Whether it is on is `D3DRS_CLIPPLANEENABLE`, which the client
+  sends too, whenever its own choice changes. So the library sets it in the
+  one place every draw comes through: the call in the device's draw routine
+  (`0x006A3642`, and `0x006A77E2` for the d3d9ex device) to the routine that
+  sends Direct3D the engine's states. After that call, for a draw made with
+  a vertex shader and with the projection the plane was worked out for, it
+  sends the client's own bits plus its own; for any other draw, the client's
+  alone. The world's vertex shaders (terrain, buildings, models, liquids,
+  particles) all multiply by that projection; a draw without a vertex shader
+  would read the plane in another space, and is left uncut. The switch is
+  sent for every such draw and not only on change, since another library
+  drawing in between may have set its own. The plane is switched off when
+  the sorted list of effects has been drawn (the call at `0x004F920B`), the
+  last of the world's solid things: the sun's glare, floating text, names
+  over heads, a fog shader's passes and the interface come after and are
+  drawn whole. A frame that never gets there has it switched off when the
+  next one starts.
 - *The cursor.* The hit test builds the cursor's ray from the camera
   (`0x004F6450`, called at `0x004F9EC1`), and the roof and the near wall,
   which are not on screen, would stop it. The ray is picked up again where
@@ -346,25 +385,32 @@ make the accident the rule wherever the character is in a room:
   with the click's own test, flags `0x100151`) until it starts in a room
   that is drawn, six surfaces at most. A point is in a drawn room if the
   nearest building surface straight below it and the nearest straight above
-  it (`0x007D59B0` again) both belong to groups the walk reached. A ray that
+  it (`0x007D59B0` again) both belong to rooms that were visited. A ray that
   never gets into one is left where the cut put it.
 
-*The cut alone.* Where the lookup finds no room although the client's own
-indoors test (`0x0071B7F0`) says the character is in one, and outdoors when
-asked, the picture is 0.3.0's: the world is drawn as usual and cut at the
-plane. The scene is told the camera stands in no building, so that the
-outdoor world is drawn whatever attic the camera hangs in, and every indoor
-group in view and under the plane is visited (walking the list of placed
-buildings, `0x00D25440`), so that buildings sliced open are not empty. It is
-the rougher picture: whatever is taller than the cut loses its top, and
-buildings that are only a shell show it.
+*Outdoors* the client's routine finds what the camera stands in, as ever,
+and the client draws from there: also from a street or a square of a city's
+model, which it draws properly only from inside. One thing is changed. A
+camera that does not stop at walls drifts into rooms the character is not
+in, an attic across the street, and from in there the client would draw
+that room and what its doorways show, with the character nowhere in the
+picture. If the group the camera is in counts as indoors, the scene's record
+of it is cleared and the scene is drawn as from outdoors.
 
-When and where the cut is made is decided once a frame, from the scene's
-lookup, the indoors test, and lines traced through the world against
-building surfaces only (`0x0077F310`, flags `0x70`): from the character's
-waist straight up and, outside the inside view, from the character's chest
-to the camera (from the chest, so that a parapet or a kerb is not "in the
-way").
+*The cut alone.* Where the lookup finds no room although the client's own
+indoors test of the character (`0x0071B7F0`) says there is one, and outdoors
+when asked, the picture is 0.3.0's: the world is drawn as usual and cut at
+the plane, and every indoor group in view and under the plane is visited
+(walking the list of placed buildings, `0x00D25440`), so that buildings
+sliced open are not empty. It is the rougher picture: whatever is taller
+than the cut loses its top, and buildings that are only a shell show it.
+
+When and where the cut is made is decided once a frame, from whether the
+character is in a room, the indoors test, and lines traced through the
+world against building surfaces only (`0x0077F310`, flags `0x70`): from the
+character's waist straight up and, outside the inside view, from the
+character's chest to the camera (from the chest, so that a parapet or a
+kerb is not "in the way").
 
 - In a room, under a roof lower than the camera: always. The cut is the set
   height over the character's feet. Under a ceiling lower than that it is
@@ -388,25 +434,35 @@ way").
   the basic cut does not depend on the trace behaving as read.
 
 What keeps a misreading of the client from doing damage. The inside view
-only ever asks the client's own routines the client's own questions and
-writes values the client writes itself; all six calls are redirected or the
-whole thing stays off. The projection is only replaced if it has exactly
-the shape the client builds for the world, the view matrix is a plain
-rotation, those two put the character on screen in front of the camera, and
-the camera looks down on the plane. If the device makes anything else of
-the matrix than expected, the standard one goes straight back; after three
-such frames the cut is given up, which the status says, and the inside view
-goes on without it.
+asks the client's own routines the client's own questions and writes values
+the client writes itself; all nine calls are redirected or the whole thing
+stays off. Direct3D is only touched if the device is one of the client's two
+Direct3D 9 classes (by its virtual table; with OpenGL there is no cut and
+the inside view goes on without). The plane is only handed over if the
+projection has exactly the shape the client builds for the world, the view
+matrix is a plain rotation, and those two put the character on screen in
+front of the camera. If Direct3D refuses the plane three times the cut is
+given up, which the status says. And nothing here is written to the
+client's projection, its depth, or its own clip-plane state.
 
-Known limits. Rooms on the camera's side of the character's are not shown.
-A wall inside the room hides what is behind it, up to the cut. The cut is
-level and takes the tops off creatures taller than it. Only building
-surfaces count as overhead, so a ship's deck or a lift, which are game
-objects, is not seen by the upward line. Names of creatures outside may
-still be drawn over the black: not yet seen either way. Possible next
-steps: fade in and out instead of switching at the door, exempt models from
-the cut (the device has clip planes of its own that only the model renderer
-uses), and something better than slicing for the outdoors.
+Other libraries. CoAVolFog patches `Wow.exe` too. None of the places it
+checks or patches is one of this library's (its list was read out of its
+DLL: the fog routine `0x00873210`, which 0.4.0 detoured, is on it, and is
+left alone now; the calls at `0x004F9213` and `0x004FB042`, which would
+have been the obvious places to end the cut, are on it as well). It sets
+`D3DRS_CLIPPLANEENABLE` to 0 for its own passes.
+
+Known limits. The picture changes at the door, at once. Under a porch roof
+that counts as outdoors the roof is drawn. A wall inside the room hides
+what is behind it, up to the cut. The cut is level and takes the tops off
+creatures taller than it. Only building surfaces count as overhead, so a
+ship's deck or a lift, which are game objects, is not seen by the upward
+line. A building whose floor is the terrain itself is not found from inside
+(the lookup stops at the terrain). Names of creatures outside may still be
+drawn over the black: not yet seen either way. Possible next steps: fade in
+and out at the door, something better than slicing for the outdoors, and
+the room under the character found the way the client finds a unit's own
+group (`0x007A13E0`) where the line down finds none.
 
 **Lua functions.** The client registers its own functions at each UI load;
 the last block of them is registered by a routine ending at `0x00530F85`.
@@ -429,26 +485,32 @@ Four things stand in for the game, which CI cannot run:
    at each address the library uses, lets the library start, and then acts
    like the client: loads the UI, calls the Lua functions, runs frames, runs
    camera updates the way the client's own update routine does. For the
-   cutaway it has a graphics device that converts a projection the way the
-   Direct3D one does, buildings with rooms and doorways laid out at the
-   client's offsets, a world of floors, ceilings and walls for lines to run
-   into, and a frame that goes through the same steps in the same order:
-   the lookup of the camera's room, the walk through the doorways, the
-   outdoor world or not, the clear, the fog; what was "drawn" is judged by
-   putting points through the matrices the device ended up with. It is built
+   cutaway it has a graphics device of the client's Direct3D class with a
+   Direct3D object behind it that records what it is asked, buildings with
+   rooms, doorways and an area table laid out at the client's offsets, a
+   world of floors, ceilings and walls for lines to run into, and a frame
+   that goes through the same steps in the same order: the lookup of the
+   camera's room, the walk through the doorways, the outdoor world or not,
+   the clear, a handful of draws of different kinds, the end of the world's
+   drawing, the interface. What was "drawn" is judged by putting points
+   through the device's matrices and the clip plane each draw had. It is built
    twice: as a 32-bit Linux program with the library compiled in
    (`client/test/run.sh`), and as a Windows program that loads the real DLL
    (`mock-client.exe`, run by CI on Windows). It is only as good as its
    picture of the client: where the two disagree, the game wins, and the mock
-   gets corrected from the disassembly.
+   gets corrected from the disassembly. 0.4.0 passed every check here and
+   still drew Stormwind's streets as rooms: the mock had the lookup answer
+   "no building" for everything outdoors, and the game does not. Its rooms
+   now include a courtyard that is a room by its flags and outdoors by the
+   area table.
 4. `client/test/installer_test.py` - the setup script against a made-up
    `Wow.exe`, under Windows PowerShell 5.1 and PowerShell 7.
 
 Each rule of the cutaway is also broken on purpose, one at a time, to see
-that a test notices (`client/test/mutation_test.py`, a few minutes, run by
-hand): 64 breakages, from "the sideways depth term is not halved" to "the
-window onto the sky is left open". Several were not noticed at first, and
-the tests were extended until they all were.
+that a test notices (`client/test/mutation_test.py`, about ten minutes, run
+by hand): 115 breakages, from "the plane's sideways term is not divided" to
+"a courtyard beyond a doorway is drawn, and gone through". Where one was
+not noticed, the tests were extended until it was.
 
 None of this shows that the real client behaves like the mock. That takes
 the game.
@@ -486,25 +548,33 @@ at `0x00400000`.
 | Camera distance after collision | `0x00605D60` | thiscall, 6 arguments. Starts from the larger of zoom and zoom blend. Returns flag bits that the caller ORs into the flags. Returns early with the zoom if flag `0x8` is set. World intersection calls at `0x00605F00` and `0x006060FE` |
 | Camera fields | | `+0x08` position, `+0x14` matrix, `+0x98` flags (`0x4` set up on its target, the normal state; `0x8` first person), `+0x118` zoom, `+0x1E8` zoom to return to after a collision, `+0x11C` and `+0x12C` yaw terms, `+0x120` pitch, `+0x124` roll |
 | World intersect (ray cast) | `0x0077F310` -> `0x007A3B70` | cdecl: Vec3* start, Vec3* end, Vec3* out, float* fraction (in: 1.0), flags, 0. Returns whether anything was hit; the hit point is start + (end - start) * fraction. Flags `0x10`, `0x20`, `0x40` select building surfaces (`0x007AE140` turns them into a mask of surface kinds: those that block movement, those that are drawn, less those marked as letting the camera through); `0x100` and others add a second routine for the terrain (`0x007A39F0`); bits in `0x40F0000F` add models and game objects. The click test uses `0x100151`, the camera `0x100171`, the cutaway `0x70` |
-| Is this unit outdoors | `0x0071B7F0` | thiscall on the unit. `IsIndoors()` and `IsOutdoors()` (`0x00612300`) are this on the player |
-| World frame's frame | `0x004FAF90` | saves the device's projection and view, updates (`0x004FA5F0`: camera, then the scene update `0x007831A0`), draws (`0x004F8EA0` -> `0x0077EFF0` -> `0x0079A870`), restores the two matrices and hands the projection to the shaders |
+| Is this unit outdoors | `0x0071B7F0` -> `0x0077FBF0` | thiscall on the unit. `IsIndoors()` and `IsOutdoors()` (`0x00612300`) are this on the player. In a building group (found by `0x007A13E0` from the groups the unit is filed under): the WMOAreaTable record's flags, 4 outdoors, 2 indoors, else the group's outdoor flag (`0x8`). On terrain: the AreaTable flags |
+| WMOAreaTable record | `0x00990560` | cdecl: model number (`+0x20` of the model file's header, which the model points to at `+0x120`), name set (`+0x104` of the placed building), group number (`+0x180` of the group's data). A binary search; null if there is none. Flags at `+0x24` |
+| World frame's frame | `0x004FAF90` | saves the device's projection and view, updates (`0x004FA5F0`: camera, then the scene update `0x007831A0`), draws (`0x004F8EA0`), draws names and icons (`0x007E5140`, still with the world's matrices), restores the two matrices and hands the projection to the shaders |
+| Drawing the world | `0x004F8EA0` | the model renderer's passes (`0x00823CB0`) around the scene (`0x0077F020` -> `0x00790A80` -> `0x0079A870`), then weather and effects, the sorted list of effects (`0x00681BA0` sorts, `0x00682960` draws; called at `0x004F920B`), the sun's glare (`0x007F0870`), floating text (`0x007E5580`) and the full-screen effects (`0x008C1010`) |
 | Device set-up from the camera | `0x00607CB0` | projection and view onto the device; also called by the hit test (`0x004F9E76`) |
-| Graphics device | `*0x00C5DF88` | projection as set at `+0xF88`, the hardware one at `+0xFC8`, view matrix stack at `+0x1B00` with its level at `+0x1AF8`. Virtual 40 sets the projection (Direct3D: `0x006A9B40`), 41 the view |
+| Graphics device | `*0x00C5DF88` | projection as set at `+0xF88`, the hardware one at `+0xFC8`, view matrix stack at `+0x1B00` with its level at `+0x1AF8`. Virtual 39 clears (`0x006A74B0`: colour as given, depth always to 1), 40 sets the projection (Direct3D: `0x006A9B40`), 41 the view. Two Direct3D 9 classes, virtual tables at `0x00A2E718` (d3d9) and `0x00A2F500` (d3d9ex) |
+| Direct3D device | `+0x397C` of the graphics device | `IDirect3DDevice9*`. Methods used here: 43 `Clear`, 55 `SetClipPlane`, 57 `SetRenderState` |
+| Engine render states | `+0x28F4` of the graphics device | pointer to 0x18-byte records, value first. 18 is the clip-plane mask, 77 the vertex shader (null for a draw without one), 78 the pixel shader. Sent to Direct3D before each draw, each by its own handler (`0x006A4C30`); the clip-plane mask only when it differs from the one last sent, kept at `+0x3E84` (all ones after a reset) |
+| A draw | `0x006A3620` (d3d9), `0x006A77C0` (d3d9ex) | thiscall: batch, indexed. Every `DrawPrimitive` and `DrawIndexedPrimitive` the client makes is in these two. Each first calls the routine that sends the states (`0x006A5940` at `0x006A3642`, `0x006A9860` at `0x006A77E2`) |
+| Client's own clip plane | `0x00684440`, used at `0x0081FE16` | plane 0, for models flagged for it; the device keeps six planes at `+0x24D4` with a dirty mask at `+0x24D0` and sends them in `0x006A3870` |
 | World projection | `0x006BF370` | rows (1/(aspect t), 0, 0, 0), (0, 1/t, 0, 0), (0, 0, (f+n)/(f-n), 1), (0, 0, -2fn/(f-n), 0); row vectors, clip z from -w to w. The Direct3D device stores (m22+1)/2 and m32/2 for the hardware and changes nothing else |
 | Projection to the shaders | `0x00872C10` | cdecl, no arguments; from the hardware matrix. 14 callers, the model renderer among them (`0x008230D0`, `0x00823130`) |
 | Scene update | `0x007831A0` | view corners `0x00795400` (from the device's matrices, by `0x006BF6D0`), then the camera's building `0x00795D40`, called at `0x00783381` |
 | Scene camera position | `0x00CD8F5C` | Vec3 |
-| Camera's building, if inside one | `*0x00CD87A4` | null outdoors; a second at `0x00CD87A0`, group lists at `0x00CDB0D4` and `0x00CDB0E4` with their counts at `+4`. Found by `0x00795D40`: a line 1760 yards straight down from the scene camera position, read once at the start, put to `0x007D59B0` |
-| Building group on a line | `0x007D59B0` | cdecl: Vec3* from, Vec3* to, float fraction (how far along counts), void* buildings[2], uint32 groups[4]. The group whose surface the line meets first; false if nothing, or if that group is an outdoor one. Takes any line |
-| Walk from the camera's rooms | `0x007B3B20` | thiscall on the placed building: the group list. Called at `0x0079AA2C`. Judges each doorway from the scene camera position (`0x007AD1F0`) |
-| Windows onto the outdoors | `0x00ADF570`, `0x00ADF58C` | each: left, top, right, bottom as fractions of the screen, then a depth that is below zero when nothing shows. Emptied (FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -1) in the scene update and again before the walk. After the walk the first decides sky, clear colour, weather and light; the second goes to the outdoor culling (`0x0079A790`), skipped if empty |
-| Screen clear in the scene draw | `0x006813B0`, called at `0x0079AB9A` | cdecl: what (3), colour. The colour is the sky's or the fog's, by the first window |
-| Fog for what is drawn next | `0x00873210` | cdecl: float start, float end, float density, uint32* colour (0xAARRGGBB). Buildings and models set theirs through it; terrain does not |
+| Camera's building, if inside one | `*0x00CD87A4` | null outdoors; a second at `0x00CD87A0`, group lists at `0x00CDB0D4` and `0x00CDB0E4` (capacity, count, pointer to the indexes). Found by `0x00795D40`: a line 1760 yards straight down from the scene camera position, read once at the start, put to the terrain test (`0x007A39F0`, flags `0x100`) and then, as far as the terrain, to `0x007D59B0`. For a group flagged `0x40`, `0x100` or `0x40000` it opens the sky's window there and then |
+| Building group on a line | `0x007D59B0` | cdecl: Vec3* from, Vec3* to, float fraction (how far along counts), void* buildings[2], uint32 groups[4]. The group whose surface the line meets first; false if nothing, or if that group has the outdoor flag (`0x8`): a street that is a group without it is found like any room. Groups flagged `0x80`, `0x10000` or `0x400000` are not tested. A line through a doorway gives both groups. Takes any line |
+| Walk from the camera's rooms | `0x007B3B20` | thiscall on the placed building: the group list. Called at `0x0079AA2C` (and for the second building at `0x0079A99E`). Visits the camera's groups, then goes through doorways (`0x007AD1F0`, recursing in `0x007AC060`): not through one whose far side the scene camera position is on; a group beyond one is visited under a view narrowed to the doorway; a doorway to a group with the outdoor flag widens the outdoor window. Then visits every group flagged `0x10000` that is in view |
+| Doorways | model `+0x13C`, `+0x138` | `+0x13C`: 8 bytes each: surface, group beyond (`0xFFFF` none), side. A group's own run of them: first at `+0x50` of its data, count at `+0x54`. `+0x138`: the surfaces, 20 bytes each |
+| Creatures into rooms | `0x00799F80` | cdecl: a rectangle. After the walk: each creature or object not yet placed goes to a visited group whose box it touches, else to the outdoor world if that is drawn, else nowhere |
+| Windows onto the outdoors | `0x00ADF570`, `0x00ADF58C` | each: left, top, right, bottom as fractions of the screen, then a depth that is below zero when nothing shows. Emptied (FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -1) in the scene update (`0x00795400`), and again after the walk of a second building. After the walk the first decides sky, clear colour, weather and light; the second goes to the outdoor culling (`0x0079A790`), skipped if empty |
+| Screen clear in the scene draw | `0x006813B0`, called at `0x0079AB9A` | cdecl: what (3: colour and depth), colour. The colour is the sky's or the fog's, by the first window |
+| Fog for what is drawn next | `0x00873210` | cdecl: float start, float end, float density, uint32* colour (0xAARRGGBB). Buildings and models set theirs through it; terrain does not. Not patched here: CoAVolFog patches it |
 | World switches | `0x00CD774C` | bit `0x100` clear: no buildings drawn, tested or looked up |
 | Scene draw | `0x0079A870` | cdecl. Finds what is in view (from the camera's building through doorways, `0x007AD1F0`, or the outdoor world), then `0x0079A260` (scenery and creatures of the visited groups, called at `0x0079AB2A`), `0x00793450` (called at `0x0079AB2F`), clears, sets up the model renderer, hands the projection to the shaders, draws (`0x007964A0`) |
-| Visit a building group | `0x00799310` | cdecl: group index, placed building. Queues the group once per frame (`+0xB4` of the placed group is nonzero while it is queued) and adds the view on top of the scene's stack as a window onto it. Needs the group's data loaded: no check. Reads `0x00CFBEB8` |
+| Visit a building group | `0x00799310` | cdecl: group index, placed building. Queues the group once per frame (`+0xB4` of the placed group is its link in the frame's list `0x00CDB080`, nonzero while it is queued) and adds the view on top of the scene's stack as a window onto it. Needs the group's data loaded: no check. Reads `0x00CFBEB8` |
 | Box outside the view | `0x0078FB20` | cdecl: Box*; nonzero if wholly outside |
-| Placed buildings | list head `0x00D25440`, link offset at `0x00D25438` | per building: flags `+0x0C` (`0x80` groups placed), bounds `+0x48`, model `+0xF4`, group links `+0x11C`, placed groups by index `+0x120`..`+0x130`. Placed group: bounds `+0x24`, index `+0x50`. Model: group records `+0x130` (0x20 bytes each, flags first), count `+0x16C`, loaded `+0x1E0`, group data `+0x1F8` (loaded bit at `+0x198` of each) |
+| Placed buildings | list head `0x00D25440`, link offset at `0x00D25438` | per building: flags `+0x0C` (`0x80` groups placed), bounds `+0x48`, model `+0xF4`, name set `+0x104`, group links `+0x11C`, placed groups by index `+0x120`..`+0x130`. Placed group: bounds `+0x24`, index `+0x50`. Model: header `+0x120`, group records `+0x130` (0x20 bytes each, flags first), count `+0x16C`, loaded `+0x1E0`, group data `+0x1F8`. Group data: flags `+0x30`, doorways `+0x50` and `+0x54`, area number `+0x180`, loaded bit at `+0x198`. Group flags: `0x8` outdoor, `0x40` lit by the sky, `0x100` shows the sky, `0x2000` indoor, `0x10000` always drawn |
 | UI shutdown | `0x00528F00` | logout, exit and reload. Raises `PLAYER_LOGOUT` (event `0xFE`, `0x0081B530`) at `0x00529025`, then writes the saved settings: bindings, macros, and from `0x0052908E` the CVar caches, each through `0x006B9BE0` (type, writer, argument), which writes the file and then (`0x006B9440`) sends it to the server unless `synchronizeSettings` is 0. The writer for CVars (`0x00512890` -> `0x007670E0`) has no other caller |
 | Register a CVar | `0x00767FC0` | cdecl: name, help, flags, default, callback, category, ... Flag `0x10`: saved per account; `0x20`: per character. Event names are a table at `0x00C24EB0` |
 | Lua state creation and registration | `0x0052A980` | sets up the UI's scripting (`0x0081A9A0`), then calls `0x005120E0`, which registers the client's functions. Two callers |

@@ -38,7 +38,9 @@ In game
 
 Hold the left mouse button to move. Click a creature, object or corpse to walk
 up and interact, attack or loot. Indoors you see the building from inside,
-looked into from above, and nothing of the world outside.
+looked into from above, and nothing of the world outside. Indoors is wherever
+the game itself has you indoors: where you cannot ride. A city's streets are
+outdoors.
 
 Nothing here uses or changes any other addon. The game's own settings that
 the mode changes while you play (camera following, click-to-move and so on)
@@ -47,7 +49,9 @@ are put back every time you log out, so your other clients never see them.
 If something is off
 -------------------
 WotLK-ARPG.log, written next to Wow.exe at every start, lists what the library
-did. /arpg status shows the same from inside the game.
+did. /arpg status shows the same from inside the game, and what the game has
+under your feet: if a place shows the wrong picture, a screenshot with that
+on it says why.
 
 Uninstall
 ---------

@@ -206,8 +206,15 @@ inline void BuildCameraMatrix(void* camera, float yaw, float pitch, float roll) 
 //     [ 0             1/t   0              0 ]      t = tan(fov / 2)
 //     [ 0             0     (f+n)/(f-n)    1 ]      n, f = near and far distance
 //     [ 0             0     -2fn/(f-n)     0 ]
-// so view space has z pointing into the screen, clip-space w is that depth,
-// and clip-space z runs from -w at the near distance to +w at the far one.
+// so view space has z pointing into the screen and clip-space w is that
+// depth. The Direct3D device (0x006A9B40) derives a second, "hardware" matrix
+// from it for Direct3D's depth range of 0 to w: m[2][2] becomes f/(f-n) and
+// m[3][2] becomes -fn/(f-n), nothing else changes. That one is what the
+// vertex shaders multiply by (0x00872C10 hands it to them), so a vertex
+// leaves a shader as p * view * hardware.
+//
+// The world's view matrix is a plain rotation: the client draws relative to
+// the camera, so a point p of the world is (p - eye) * view in view space.
 // ---------------------------------------------------------------------------
 
 struct Matrix {
@@ -225,34 +232,76 @@ constexpr size_t kGxDeviceHardwareProjection = 0x0FC8;  // Matrix: what the Dire
 constexpr size_t kGxDeviceViewLevel = 0x1AF8;           // uint32_t: top of the view matrix stack, 0 to 3
 constexpr size_t kGxDeviceViewStack = 0x1B00;           // Matrix[4]
 
-// Slot in the device's virtual table:
-// void __thiscall (const Matrix*). The Direct3D device (0x006A9B40) keeps the
-// matrix and derives the hardware one from it: depth is rescaled from -w..w
-// to Direct3D's 0..w by replacing m[2][2] with (m[2][2] + 1) / 2 and m[3][2]
-// with m[3][2] / 2 (it gets there by way of the near and far distances, and
-// divides by m[2][2] - 1 on the way). No other element changes.
-constexpr size_t kGxDeviceVirtualSetProjection = 40;
+// The two Direct3D 9 devices the client has (gxApi "d3d9" and "d3d9ex"),
+// told apart from its OpenGL one by the virtual table an object starts with.
+// The second class derives from the first and keeps its fields.
+constexpr uintptr_t kGxDeviceClassDirect3D9 = 0x00A2E718;
+constexpr uintptr_t kGxDeviceClassDirect3D9Ex = 0x00A2F500;
 
-inline void SetProjection(uint8_t* device, const Matrix* projection) {
-    void** virtuals = *reinterpret_cast<void***>(device);
-    reinterpret_cast<void (__thiscall*)(uint8_t*, const Matrix*)>(virtuals[kGxDeviceVirtualSetProjection])(
-        device, projection);
+inline bool IsDirect3DDevice(const uint8_t* device) {
+    const uintptr_t virtuals = *reinterpret_cast<const uintptr_t*>(device);
+    return virtuals == kGxDeviceClassDirect3D9 || virtuals == kGxDeviceClassDirect3D9Ex;
 }
 
-// void __cdecl (): hands the hardware projection to the vertex shaders. The
-// client calls it after every change of projection while drawing.
-constexpr uintptr_t kUpdateShaderProjection = 0x00872C10;
+// In a Direct3D device:
+constexpr size_t kGxDeviceDirect3D = 0x397C;  // IDirect3DDevice9*
 
-inline void UpdateShaderProjection() {
-    reinterpret_cast<void (__cdecl*)()>(kUpdateShaderProjection)();
+// The engine's render states: an array of 0x18-byte records, value first,
+// holding what the next draw is to be made with. Just before each draw the
+// device sends Direct3D whatever has changed (0x006A5940, 0x006A9860).
+constexpr size_t kGxDeviceStates = 0x28F4;    // pointer to the records
+constexpr size_t kGxStateSize = 0x18;
+constexpr size_t kGxStateClipPlanes = 18;     // uint32_t: a bit for each user clip plane that is on
+constexpr size_t kGxStateVertexShader = 77;   // the vertex shader, or null for a draw without one
+
+// What the device last sent Direct3D for the clip-plane state
+// (D3DRS_CLIPPLANEENABLE): it sends again only when the state above differs
+// from this (0x006A50E4). All ones until it has sent anything. The client
+// itself uses plane 0 alone, for a few models (0x0081FD6B).
+constexpr size_t kGxDeviceSentClipPlanes = 0x3E84;  // uint32_t
+constexpr uint32_t kGxNothingSent = 0xFFFFFFFF;
+
+// IDirect3DDevice9, as far as it is used here. COM: the object is the first
+// argument of each method, __stdcall, and a negative result means failure.
+constexpr size_t kDirect3DClear = 43;           // (count, rects, flags, colour, float z, stencil)
+constexpr size_t kDirect3DSetClipPlane = 55;    // (index, const float plane[4])
+constexpr size_t kDirect3DSetRenderState = 57;  // (state, value)
+constexpr uint32_t kDirect3DClearDepth = 0x2;        // D3DCLEAR_ZBUFFER
+constexpr uint32_t kDirect3DClipPlaneEnable = 152;   // D3DRS_CLIPPLANEENABLE
+
+inline void** Direct3DVirtuals(void* direct3d) {
+    return *reinterpret_cast<void***>(direct3d);
+}
+
+// With a vertex shader, a user clip plane is in clip space: a vertex is kept
+// if its clip-space position (x, y, z, w) dotted with the plane is not
+// negative. Depth is not touched by it.
+inline long Direct3DSetClipPlane(void* direct3d, uint32_t index, const float* plane) {
+    return reinterpret_cast<long (__stdcall*)(void*, uint32_t, const float*)>(
+        Direct3DVirtuals(direct3d)[kDirect3DSetClipPlane])(direct3d, index, plane);
+}
+
+inline long Direct3DSetRenderState(void* direct3d, uint32_t state, uint32_t value) {
+    return reinterpret_cast<long (__stdcall*)(void*, uint32_t, uint32_t)>(
+        Direct3DVirtuals(direct3d)[kDirect3DSetRenderState])(direct3d, state, value);
+}
+
+// Clears the depth buffer alone, within the viewport, to `depth` (0 near, 1 far).
+inline long Direct3DClearDepth(void* direct3d, float depth) {
+    return reinterpret_cast<long (__stdcall*)(void*, uint32_t, const void*, uint32_t, uint32_t, float, uint32_t)>(
+        Direct3DVirtuals(direct3d)[kDirect3DClear])(direct3d, 0, nullptr, kDirect3DClearDepth, 0, depth, 0);
 }
 
 // ---------------------------------------------------------------------------
 // The world scene
 //
-// Once per frame the world frame updates the camera, sets the device's view
-// and projection from it (0x00607CB0), updates the scene (0x007831A0), draws
-// it (0x0079A870) and puts the device's matrices back (all from 0x004FAF90).
+// Once per frame the world frame (0x004FAF90) updates the camera, sets the
+// device's view and projection from it (0x00607CB0), updates the scene
+// (0x007831A0), draws the world (0x004F8EA0) and puts the device's matrices
+// back. Drawing the world is: the scene (0x0079A870), then see-through
+// models and effects, ending with a sorted list of them (0x004F920B); and
+// after those the sun's glare, floating text, names over heads and the
+// full-screen effects.
 //
 // Buildings, caves and dungeons are "map objects": a placed building has
 // groups (rooms and outer shells). Outdoor groups are drawn when they are in
@@ -269,6 +318,8 @@ constexpr uintptr_t kSceneCameraPosition = 0x00CD8F5C;  // Vec3: the camera posi
 constexpr uintptr_t kSceneCameraBuilding = 0x00CD87A4;         // placed building, or null outdoors
 constexpr uintptr_t kSceneCameraBuildingSecond = 0x00CD87A0;   // a second one, where two overlap
 constexpr uintptr_t kSceneCameraGroupCount = 0x00CDB0D8;       // uint32_t: how many of its groups
+constexpr uintptr_t kSceneCameraGroups = 0x00CDB0DC;           // uint32_t*: their indexes (the list the walk gets
+                                                               // starts 8 bytes before: capacity, count, data)
 constexpr uintptr_t kSceneCameraGroupCountSecond = 0x00CDB0E8; // uint32_t
 constexpr uintptr_t kSceneCameraBuildingName = 0x00CD8628;     // char[]: its file name, for the client's diagnostics
 constexpr uintptr_t kSceneCameraGroupName = 0x00CD8730;        // char[]
@@ -286,6 +337,7 @@ constexpr uintptr_t kPlacedBuildingsLinkOffset = 0x00D25438;  // int32_t
 constexpr size_t kBuildingFlags = 0x0C;       // uint32_t
 constexpr size_t kBuildingBounds = 0x48;      // Box, world coordinates
 constexpr size_t kBuildingModel = 0xF4;       // the building's model, shared by every placement of it
+constexpr size_t kBuildingNameSet = 0x104;    // uint32_t: which of the model's sets of area names this placement uses
 constexpr size_t kBuildingGroupLinkOffset = 0x114;  // int32_t: where in a group link its list link sits
 constexpr size_t kBuildingGroupLinks = 0x11C; // first group link; same list rules as above
 constexpr size_t kBuildingGroupArray = 0x120; // placed groups by index: four pointers here...
@@ -300,22 +352,63 @@ constexpr size_t kGroupLinkGroup = 0x04;  // in a group link: the placed group
 constexpr size_t kPlacedGroupBounds = 0x24;  // Box, world coordinates
 constexpr size_t kPlacedGroupIndex = 0x50;   // uint32_t: which of the model's groups
 constexpr size_t kPlacedGroupQueued = 0xB4;  // nonzero while the group is on this frame's list of groups to
-                                             // draw (0x00CDB080): the visit looks at this to queue it once
+                                             // draw (0x00CDB080; it is the list's link): the visit looks at
+                                             // this to queue it once
 
 // A building's model.
+constexpr size_t kModelHeader = 0x120;      // pointer to the model file's header
 constexpr size_t kModelGroupInfo = 0x130;   // array of 0x20-byte records, one per group, flags first
+constexpr size_t kModelDoorways = 0x13C;    // array of 8-byte records, see below
 constexpr size_t kModelGroupCount = 0x16C;  // uint32_t
 constexpr size_t kModelLoaded = 0x1E0;      // uint32_t: nonzero once the model file is in
 constexpr size_t kModelGroups = 0x1F8;      // array of pointers to the groups' own data
 constexpr size_t kModelGroupInfoSize = 0x20;
 
-constexpr size_t kGroupDataLoadFlags = 0x198;  // uint32_t, in a group's own data
+constexpr size_t kModelHeaderId = 0x20;     // uint32_t, in the header: the model's number in the area table below
+
+// A group's own data.
+constexpr size_t kGroupDataFlags = 0x30;          // uint32_t: the same flags as in the model's record
+constexpr size_t kGroupDataFirstDoorway = 0x50;   // uint32_t: where the group's doorways start in kModelDoorways
+constexpr size_t kGroupDataDoorwayCount = 0x54;   // uint32_t
+constexpr size_t kGroupDataAreaId = 0x180;        // uint32_t: the group's number in the area table below
+constexpr size_t kGroupDataLoadFlags = 0x198;     // uint32_t
 constexpr uint32_t kGroupDataLoaded = 0x1;
+
+// One side of a doorway ("portal"): each group lists its own, and the
+// group on the other side lists the same doorway from there.
+struct Doorway {
+    uint16_t surface;  // which opening, among the model's
+    uint16_t group;    // the group on the other side; 0xFFFF for none
+    int16_t side;
+    uint16_t unused;
+};
+constexpr uint16_t kNoGroup = 0xFFFF;
 
 // Group flags, from the model file.
 constexpr uint32_t kGroupFlagOutdoor = 0x8;             // drawn with the outdoor world
 constexpr uint32_t kGroupFlagOutdoorLit = 0x40;         // indoors, but lit by the sky
-constexpr uint32_t kGroupFlagAlwaysOutdoor = 0x10000;   // has no doorways; treated like an outdoor group
+constexpr uint32_t kGroupFlagAlwaysOutdoor = 0x10000;   // has no doorways; drawn whenever it is in view
+
+// Whether a place inside a building counts as outdoors is not the group
+// flag alone. A city's streets and squares are often groups without it:
+// rooms as far as drawing goes, entered through doorways, only without a
+// ceiling. The client's own answer (0x0077FBF0, behind IsIndoors() and
+// IsOutdoors(), and so behind where one may ride) goes by WMOAreaTable.dbc
+// first: the record for (model, name set, group) says "outdoors" with flag
+// 4, "indoors" with flag 2, and only where neither is set, or there is no
+// record, does the group flag decide.
+//
+// const void* __cdecl (uint32_t model, uint32_t nameSet, uint32_t group):
+// the record, or null.
+constexpr uintptr_t kFindBuildingArea = 0x00990560;
+constexpr size_t kAreaFlags = 0x24;  // uint32_t, in the record
+constexpr uint32_t kAreaFlagIndoors = 0x2;
+constexpr uint32_t kAreaFlagOutdoors = 0x4;
+
+inline const void* FindBuildingArea(uint32_t model, uint32_t nameSet, uint32_t group) {
+    return reinterpret_cast<const void* (__cdecl*)(uint32_t, uint32_t, uint32_t)>(kFindBuildingArea)(
+        model, nameSet, group);
+}
 
 struct Box {
     Vec3 low;
@@ -378,13 +471,29 @@ constexpr uint32_t kIntersectClick = 0x00100151;
 // is in (0x00795D40); it is a plain line-against-surfaces test and takes
 // any line. `fraction` limits how far along the line counts (1: all of
 // it). Returns false, and null in buildings[0], if the line meets nothing
-// or if what it meets first is an outdoor group (kGroupFlagOutdoor).
-// Otherwise buildings[0] is the placed building and groups[0] the group.
+// or if what it meets first is a group with kGroupFlagOutdoor. Otherwise
+// buildings[0] is the placed building and groups[0] the group, which may
+// well be a street: see the note on what counts as outdoors above.
 constexpr uintptr_t kFindGroupOnLine = 0x007D59B0;
 
-inline bool FindGroupOnLine(const Vec3& from, const Vec3& to, void** buildings, uint32_t* groups) {
+inline bool FindGroupOnLine(const Vec3& from, const Vec3& to, float fraction, void** buildings, uint32_t* groups) {
     return reinterpret_cast<bool (__cdecl*)(const Vec3*, const Vec3*, float, void**, uint32_t*)>(
-        kFindGroupOnLine)(&from, &to, 1.0f, buildings, groups);
+        kFindGroupOnLine)(&from, &to, fraction, buildings, groups);
+}
+
+// bool __cdecl (const Vec3* from, const Vec3* to, float* fraction,
+// uint32_t flags, void** chunk): whether the line meets the terrain, and how
+// far along. The client's camera lookup asks this first, with flags 0x100,
+// and lets the building lookup count only up to there: a mine under a hill
+// is not what someone walking on the hill is in.
+constexpr uintptr_t kIntersectTerrain = 0x007A39F0;
+constexpr float kCameraLookupDepth = 1760.0f;  // yards straight down the client's lookup goes
+
+inline bool IntersectTerrain(const Vec3& from, const Vec3& to, float* fraction) {
+    void* chunk = nullptr;
+    *fraction = 1.0f;
+    return reinterpret_cast<bool (__cdecl*)(const Vec3*, const Vec3*, float*, uint32_t, void**)>(
+        kIntersectTerrain)(&from, &to, fraction, 0x100, &chunk);
 }
 
 // uint32_t: world switches. With this bit clear the client draws and tests
@@ -407,13 +516,6 @@ constexpr uintptr_t kSceneSkyWindow = 0x00ADF570;
 constexpr uintptr_t kSceneOutdoorWindow = 0x00ADF58C;
 constexpr OutdoorWindow kNoOutdoorWindow = {3.4028234664e38f, 3.4028234664e38f, -3.4028234664e38f,
                                             -3.4028234664e38f, -1.0f};
-
-// void __cdecl (float start, float end, float density, const uint32_t*
-// colour): sets the fog for what is drawn next. Buildings (0x007A8440,
-// 0x007A9380) and models (0x0081F9E0) set theirs through this; terrain does
-// not. Colour is 0xAARRGGBB.
-constexpr uintptr_t kSetFog = 0x00873210;
-constexpr uint8_t kSetFogBytes[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14};
 
 // bool __thiscall CGUnit(): whether the unit is outdoors; the client's
 // IsIndoors() and IsOutdoors() are this test on the player (0x00612300).
@@ -521,18 +623,40 @@ constexpr uint8_t kBeforeDrawingCallBytes[] = {0xE8, 0x1C, 0x89, 0xFF, 0xFF};
 
 // In the scene draw, when the camera stands in a building:
 // void __thiscall PlacedBuilding(void* groups) (0x007B3B20), the walk from
-// the camera's groups through doorways to every room in view. It hands the
-// client's camera position (kSceneCameraPosition) to the routine that
-// judges each doorway (0x007AD1F0). Right after it the client looks at
-// kSceneOutdoorWindow to see whether to draw the outdoor world as well.
+// the camera's groups through doorways to every room in view (0x007AD1F0,
+// 0x007AC060). It visits each of the camera's groups under the whole-screen
+// view, and from each goes on through the doorways, judging them from the
+// client's camera position (kSceneCameraPosition): a doorway whose far side
+// the camera is on is not gone through, and a room beyond one is visited
+// under a view narrowed to the doorway. A doorway to an outdoor group opens
+// kSceneOutdoorWindow, which the client looks at right after the walk to
+// see whether to draw the outdoor world as well; then (0x00799F80) it deals
+// creatures and objects out among the groups visited so far.
 constexpr uintptr_t kWalkRoomsCall = 0x0079AA2C;
 constexpr uint8_t kWalkRoomsCallBytes[] = {0xE8, 0xEF, 0x90, 0x01, 0x00};
 
 // In the scene draw, after kBeforeDrawingCall: void __cdecl (uint32_t what,
-// uint32_t colour) (0x006813B0), clears the screen. `what` is 3; the colour
-// is the fog's when no sky shows.
+// uint32_t colour) (0x006813B0), clears the screen. `what` is 3, colour and
+// depth; the colour is the fog's when no sky shows. Depth is cleared to 1,
+// the far end (0x006A74B0).
 constexpr uintptr_t kSceneClearCall = 0x0079AB9A;
 constexpr uint8_t kSceneClearCallBytes[] = {0xE8, 0x11, 0x68, 0xEE, 0xFF};
+
+// In the two Direct3D devices' draw routines (0x006A3620, 0x006A77C0), which
+// every draw goes through: void __thiscall CGxDevice() (0x006A5940,
+// 0x006A9860), which sends Direct3D the engine's render states, shaders and
+// matrices for the draw. The draw itself follows.
+constexpr uintptr_t kDrawSyncCall = 0x006A3642;
+constexpr uint8_t kDrawSyncCallBytes[] = {0xE8, 0xF9, 0x22, 0x00, 0x00};
+constexpr uintptr_t kDrawSyncExCall = 0x006A77E2;
+constexpr uint8_t kDrawSyncExCallBytes[] = {0xE8, 0x79, 0x20, 0x00, 0x00};
+
+// In the world's drawing (0x004F8EA0), after the scene and the see-through
+// models: void __cdecl (uint32_t list, const Vec3* from) (0x00682960), draws
+// the sorted list of effects. It is the last of the world drawn as solid
+// things in their places; the sun's glare, floating text and names follow.
+constexpr uintptr_t kWorldDrawnCall = 0x004F920B;
+constexpr uint8_t kWorldDrawnCallBytes[] = {0xE8, 0x50, 0x97, 0x18, 0x00};
 
 // In the cursor's hit test (0x004F9DA0), which first sets the device's
 // projection afresh from the camera:

@@ -169,8 +169,9 @@ heading("Buildings and caves", -180)
 
 makeCheck("cutaway", {
     y = -196, label = "Indoors, show only the inside of the building",
-    tooltip = "Under a roof you look into the rooms from above: the roof and the walls on the camera's side "
-        .. "are left out, and so is everything outdoors, which goes black. Clicks go through what is left out.",
+    tooltip = "Wherever the game has you indoors (where you cannot ride), you look into the rooms from above: "
+        .. "the roof and the walls on the camera's side are left out, and so is everything outdoors, which "
+        .. "goes black. Clicks go through what is left out.",
     apply = applyCutaway,
 })
 
@@ -185,9 +186,9 @@ makeSlider("cutawayHeight", {
 
 makeCheck("cutawayOutdoors", {
     y = -274, label = "Outdoors, slice the world when a building hides you",
-    tooltip = "When an archway or a building comes between the camera and your character outdoors, everything "
-        .. "above it is cut away, all over the screen. Rough: other buildings are sliced open too, and many "
-        .. "of them are hollow.",
+    tooltip = "When an archway, a porch roof or a building comes between the camera and your character "
+        .. "outdoors, everything above it is cut away, all over the screen. Rough: other buildings are sliced "
+        .. "open too, and many of them are hollow.",
     apply = applyCutaway,
 })
 
@@ -259,7 +260,7 @@ local function refresh()
     setSliderEnabled(sliders.camPitch, camera)
     setSliderEnabled(sliders.camDistance, camera)
     setSliderEnabled(sliders.camYaw, camera)
-    setCheckEnabled(checks.cutaway, cutaway, "Needs the client library, version 0.4.0 or later.")
+    setCheckEnabled(checks.cutaway, cutaway, "Needs the client library, version 0.5.0 or later.")
     setSliderEnabled(sliders.cutawayHeight, cutaway and db.cutaway)
     setCheckEnabled(checks.cutawayOutdoors, cutaway and db.cutaway)
     setCheckEnabled(checks.indoorCollision, camera and not (cutaway and db.cutaway), camera
