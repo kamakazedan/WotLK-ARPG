@@ -31,6 +31,9 @@ local defaults = {
     camPitch = 55,          -- degrees above the horizon the camera looks down from
     camDistance = 30,       -- yards from the character
     indoorCollision = true, -- let the camera collide while the character is indoors
+    groundClicks = true,    -- move clicks on roofs and treetops go to the ground under the cursor
+    groundClickHeight = 3,  -- yards above the character's feet that still count as somewhere to walk
+    soundAtCamera = true,   -- hear the world from the camera, so left and right match the screen
 }
 
 function ns.Print(msg)
@@ -87,6 +90,23 @@ function ns:StopHold()
     end
 end
 
+-- Roofs and treetops: tell the library whether, and from what height, a move
+-- click should go to the ground under the cursor instead.
+function ns:ClientCanGroundClick()
+    return type(ARPG_SetGroundClicks) == "function"
+end
+
+function ns:ApplyGroundClicks()
+    if not self:ClientCanGroundClick() then
+        return
+    end
+    if self.db.enabled and self.db.groundClicks then
+        ARPG_SetGroundClicks(self.db.groundClickHeight)
+    else
+        ARPG_SetGroundClicks()
+    end
+end
+
 ---------------------------------------------------------------------------
 -- Applying state
 ---------------------------------------------------------------------------
@@ -101,6 +121,7 @@ function ns:Sync(quiet)
         self:RestoreCVars()
     end
     self:ApplyClientCamera()
+    self:ApplyGroundClicks()
     self:StopHold()
 
     if InCombatLockdown() then
@@ -229,6 +250,11 @@ function ns:PrintStatus()
             onOff(self:ClientCanLockCamera(), "working", "NOT working")))
         ns.Print(format("Camera: facing %d, angle %d, distance %d, collides indoors: %s.", db.camYaw, db.camPitch,
             db.camDistance, onOff(db.indoorCollision, "yes", "no")))
+        self:PrintCameraProof()
+        if self:ClientCanGroundClick() then
+            ns.Print(format("Clicks on roofs and treetops go to the ground: %s (above %d yards).",
+                onOff(db.groundClicks, "yes", "no"), db.groundClickHeight))
+        end
         if not (self:ClientCanHoldMove() and self:ClientCanLockCamera()) then
             ns.Print("Something is off: please send WotLK-ARPG.log from the game folder.")
         end
@@ -243,11 +269,32 @@ function ns:PrintStatus()
     end
 end
 
+-- Says whether the client is really using the locked camera, from the
+-- library's own count of the camera updates it has changed.
+function ns:PrintCameraProof()
+    if type(ARPG_CameraInfo) ~= "function" then
+        return
+    end
+    local asked, angleRuns, angleLocked, distanceRuns, distanceLocked = ARPG_CameraInfo()
+    if asked ~= 1 then
+        ns.Print("The camera is not locked at the moment.")
+    elseif angleLocked > 0 and distanceLocked > 0 then
+        ns.Print(format("The camera lock is in effect: applied in %d of %d camera updates since the UI loaded.",
+            distanceLocked, distanceRuns))
+    else
+        ns.Print(format("|cffff2020The camera lock is asked for but is not taking effect|r (%d and %d camera "
+            .. "updates seen, %d and %d locked). Please send this line and WotLK-ARPG.log.",
+            angleRuns, distanceRuns, angleLocked, distanceLocked))
+    end
+end
+
 function ns:PrintHelp()
     ns.Print("Commands:")
     ns.Print("  /arpg - turn the mode on or off (also: /arpg on, /arpg off)")
     ns.Print("  /arpg wasd - lock or unlock WASD movement (in combat use the key binding)")
     ns.Print("  /arpg options - camera settings (also: /arpg angle 55, /arpg distance 30, /arpg facing 0)")
+    ns.Print("  /arpg ground - roof and treetop clicks go to the ground, on or off (/arpg ground 3 sets the height)")
+    ns.Print("  /arpg sound - hear the world from the camera or from the character")
     ns.Print("  /arpg camedit - free the camera, mouse and scroll wheel for a look around")
     ns.Print("  /arpg status - show the current state")
     ns.Print("  /arpg resetmouse - restore the default left and right mouse bindings")
@@ -283,6 +330,36 @@ local function setCameraSetting(setting, text)
     end
 end
 
+-- /arpg ground: toggle; /arpg ground 3: on, from that many yards up.
+function ns:SetGroundClicks(text)
+    local height = tonumber(text)
+    if height then
+        self.db.groundClickHeight = math.max(1, math.min(30, floor(height + 0.5)))
+        self.db.groundClicks = true
+    else
+        self.db.groundClicks = not self.db.groundClicks
+    end
+    self:ApplyGroundClicks()
+    if self.db.groundClicks then
+        ns.Print(format("Move clicks more than %d yards above the character go to the ground under the cursor.",
+            self.db.groundClickHeight))
+    else
+        ns.Print("Move clicks land wherever the cursor is, roofs included.")
+    end
+    if not self:ClientCanGroundClick() then
+        ns.Print("This needs the client library (0.2.1 or later), which is not loaded.")
+    end
+end
+
+function ns:SetSoundAtCamera(on)
+    self.db.soundAtCamera = on and true or false
+    if self.db.enabled then
+        self:ApplyCVars()
+    end
+    ns.Print(self.db.soundAtCamera and "Sound is heard from the camera: left and right match the screen."
+        or "Sound is heard from the character.")
+end
+
 SLASH_WOTLKARPG1 = "/arpg"
 SlashCmdList["WOTLKARPG"] = function(msg)
     local cmd, arg = strlower(strtrim(msg or "")):match("^(%S*)%s*(.-)$")
@@ -296,6 +373,10 @@ SlashCmdList["WOTLKARPG"] = function(msg)
         ns:ToggleMoveLock()
     elseif cameraSettings[cmd] then
         setCameraSetting(cameraSettings[cmd], arg)
+    elseif cmd == "ground" then
+        ns:SetGroundClicks(arg)
+    elseif cmd == "sound" then
+        ns:SetSoundAtCamera(not ns.db.soundAtCamera)
     elseif cmd == "options" or cmd == "config" then
         ns:OpenOptions()
     elseif cmd == "camedit" then

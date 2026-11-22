@@ -13,7 +13,8 @@ local ADDON, ns = ...
 ns.VIEW_SLOT = 5 -- which of the client's saved camera views holds the ARPG camera
 
 -- CVar values while the mode is on. The originals are snapshotted in the
--- saved variables and put back when the mode is turned off.
+-- saved variables and put back when the mode is turned off. An entry with a
+-- third field is only applied while that setting is on.
 local CVARS = {
     { "autointeract", "1" },              -- click-to-move (hold-to-move builds on it)
     { "cameraSmoothStyle", "0" },         -- camera following style: never
@@ -21,6 +22,9 @@ local CVARS = {
     { "cameraDistanceMax", "50" },        -- room for a high top-down camera
     { "cameraTerrainTilt", "0" },         -- do not tilt with slopes
     { "cameraViewBlendStyle", "2" },      -- saved views snap instead of gliding
+    -- "Sound at Character" off: the listener sits at the camera and faces the
+    -- way it faces, so a sound on the right of the screen is heard on the right.
+    { "Sound_ListenerAtCharacter", "0", "soundAtCamera" },
 }
 
 -- CVars differ between client builds, so never assume one exists.
@@ -42,9 +46,17 @@ function ns:ApplyCVars()
     local db = self.db
     db.savedCVars = db.savedCVars or {}
     for _, entry in ipairs(CVARS) do
-        local name, wanted = entry[1], entry[2]
+        local name, wanted, setting = entry[1], entry[2], entry[3]
         local current = getCVar(name)
-        if current ~= nil then
+        if current == nil then
+            -- this client has no such CVar
+        elseif setting and not db[setting] then
+            -- Switched off in the settings: give the player's own value back.
+            if db.savedCVars[name] ~= nil then
+                setCVar(name, db.savedCVars[name])
+                db.savedCVars[name] = nil
+            end
+        else
             -- Snapshot once, so a later login cannot overwrite the player's
             -- real setting with the value the mode itself wrote.
             if db.savedCVars[name] == nil then
