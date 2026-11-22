@@ -55,7 +55,7 @@ void EmitRelative(uint8_t* out, uint8_t opcode, uintptr_t at, uintptr_t target) 
     out[4] = static_cast<uint8_t>(relative >> 24);
 }
 
-// Where the `jmp rel32` at `jump` goes.
+// Where the `jmp rel32` or `call rel32` at `jump` goes.
 uintptr_t JumpTarget(const uint8_t* jump) {
     const uint32_t bits = static_cast<uint32_t>(jump[1]) | static_cast<uint32_t>(jump[2]) << 8 |
         static_cast<uint32_t>(jump[3]) << 16 | static_cast<uint32_t>(jump[4]) << 24;
@@ -190,6 +190,34 @@ Result CallBeforeReturn(const Site& site, void (*after)()) {
     uint8_t patch[kJumpLength];
     EmitRelative(patch, kJump, site.address, reinterpret_cast<uintptr_t>(thunk));
     if (!WriteCode(site.address, patch, kJumpLength)) {
+        return Failed(site, "could not make the code writable");
+    }
+    logfile::Write("  %s at %x: %s.", site.name, static_cast<uint32_t>(site.address), Describe(result));
+    return result;
+}
+
+Result RedirectCall(const Site& site, void* replacement, void** original) {
+    const uint8_t* code = reinterpret_cast<const uint8_t*>(site.address);
+    if (site.expectedLength != kJumpLength || site.expected[0] != kCall) {
+        return Failed(site, "bad site definition");
+    }
+
+    Result result = Result::kInstalled;
+    if (Equal(code, site.expected, site.expectedLength)) {
+        // Stock code.
+    } else if (code[0] == kCall) {
+        // Another library already sends this call somewhere else. Calling
+        // "the original" then means calling its routine.
+        result = Result::kChained;
+    } else {
+        return Mismatch(site);
+    }
+
+    uint8_t patch[kJumpLength];
+    EmitRelative(patch, kCall, site.address, reinterpret_cast<uintptr_t>(replacement));
+    *original = reinterpret_cast<void*>(JumpTarget(code));  // valid before the patch goes live
+    if (!WriteCode(site.address, patch, kJumpLength)) {
+        *original = nullptr;
         return Failed(site, "could not make the code writable");
     }
     logfile::Write("  %s at %x: %s.", site.name, static_cast<uint32_t>(site.address), Describe(result));

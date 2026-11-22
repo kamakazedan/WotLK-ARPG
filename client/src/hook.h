@@ -5,8 +5,9 @@
 // another mod's patch must never lead to a crash.
 //
 // The one foreign patch that is understood is another library's 5-byte jump
-// (E9 rel32) at the same spot, which is how detour libraries hook a function.
-// In that case this hook is placed in front of theirs and theirs still runs.
+// (E9 rel32) at the same spot, which is how detour libraries hook a function,
+// or, at a call instruction, another library's call (E8 rel32). In that case
+// this hook is placed in front of theirs and theirs still runs.
 #pragma once
 
 #include <stddef.h>
@@ -36,6 +37,13 @@ Result Detour(const Site& site, void* replacement, void** original);
 // For a function ending in `ret` followed by padding: runs `after()` just
 // before it returns. site.expected must be the ret and at least 4 padding bytes.
 Result CallBeforeReturn(const Site& site, void (*after)());
+
+// For a `call rel32` instruction inside a function: makes it call
+// `replacement` instead. `*original` then holds the address it called before,
+// to be called with the same arguments and calling convention. site.expected
+// must be the five bytes of the stock instruction; site.stolenLength is not
+// used.
+Result RedirectCall(const Site& site, void* replacement, void** original);
 
 bool IsActive(Result result);
 const char* Describe(Result result);
