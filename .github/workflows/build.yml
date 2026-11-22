@@ -1,0 +1,101 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm lua5.1
+          clang++ --version | head -1
+          lld-link --version | head -1
+
+      - name: Check the addon
+        run: |
+          for file in addon/WotLK-ARPG/*.lua; do
+            luac5.1 -p "$file" && echo "ok   $file"
+          done
+          python3 -c "import sys, xml.dom.minidom; xml.dom.minidom.parse(sys.argv[1]); print('ok  ', sys.argv[1])" \
+            addon/WotLK-ARPG/Bindings.xml
+
+      - name: Build the library
+        run: client/build.sh
+
+      - name: Test the hook engine, and the library against the mock client
+        run: client/test/run.sh
+
+      - name: Test the setup script (PowerShell 7)
+        run: python3 client/test/installer_test.py --shell pwsh
+
+      - name: Package
+        run: tools/package.sh
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v7
+        with:
+          name: WotLK-ARPG
+          path: dist/WotLK-ARPG/
+          if-no-files-found: error
+
+      - name: Upload the Windows test program
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-test
+          path: |
+            client/build/WotLK-ARPG.dll
+            client/build/mock-client.exe
+          if-no-files-found: error
+
+  windows:
+    name: Test on Windows
+    needs: linux
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fetch the build
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-test
+          path: client/build
+
+      # The DLL exactly as it will be installed, loaded by a program that
+      # stands in for the game (client/test/mock_client.cpp).
+      - name: Run the real DLL against the mock client
+        shell: cmd
+        working-directory: client/build
+        run: |
+          mock-client.exe
+          set RESULT=%ERRORLEVEL%
+          echo.
+          echo -- the library's log from that run --
+          if exist WotLK-ARPG.log (type WotLK-ARPG.log) else (echo no log was written)
+          exit /b %RESULT%
+
+      # Twice, because the two ways of getting to Windows PowerShell differ:
+      # started from a PowerShell 7 session it inherits that session's module
+      # path and loses some of its own commands.
+      - name: Test the setup script, started from PowerShell 7 (Windows PowerShell 5.1, PowerShell 7, the .bat files)
+        shell: pwsh
+        run: python client/test/installer_test.py
+
+      - name: Test the setup script, started from cmd as a double-click would (Windows PowerShell 5.1, the .bat files)
+        shell: cmd
+        run: python client/test/installer_test.py --shell powershell

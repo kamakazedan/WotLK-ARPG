@@ -11,6 +11,7 @@ Screenshots/
 
 # Build output (binaries come from CI, not from commits).
 build/
+dist/
 out/
 .vs/
 *.dll
@@ -18,3 +19,6 @@ out/
 *.pdb
 *.obj
 *.zip
+
+# Python
+__pycache__/
