@@ -1,0 +1,8 @@
+<Bindings>
+	<Binding name="WOTLKARPG_TOGGLE" header="WOTLKARPG">
+		WotLKARPG_Toggle();
+	</Binding>
+	<!-- Clicks the secure button directly, so this one also works in combat. -->
+	<Binding name="CLICK WotLKARPGMoveLock:LeftButton">
+	</Binding>
+</Bindings>
