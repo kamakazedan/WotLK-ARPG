@@ -16,8 +16,11 @@ privately run AzerothCore server.
 5. WASD disabled unless switched on.
 6. Everything reversible with one switch.
 
-All six are built; 4, the cutaway, has not been through the game yet. Added
-since, from playing it:
+All six are built. For 4, cutting the whole world open (0.3.0) worked in the
+game but showed too much: hollow buildings, the bare ground under a city.
+What was asked for after seeing it is the building from inside and nothing
+else, on black (0.4.0, not yet through the game). Added since, from playing
+it:
 
 7. Move clicks stay at ground level: a click on a roof or a treetop goes to
    the ground under the cursor. (Built.)
@@ -30,6 +33,8 @@ since, from playing it:
     window that can be clicked to travel there. (Planned.)
 11. Nothing here uses or changes another addon: the other addons on the
     client must work exactly as before, for playing the usual way. (A rule.)
+12. Nothing of the mode is left in the game's own settings, which follow the
+    account to every client it logs in from. (A rule, after 0.3.0 broke it.)
 
 ## Three layers
 
@@ -57,9 +62,10 @@ Found by testing in-game with CVars and bindings alone:
 
 - `Core.lua` - saved variables, `ns:Sync()`, events, `/arpg`, and the few
   lines that talk to the library.
-- `Camera.lua` - CVar snapshot and restore; the locked camera (library) or a
-  saved camera view in slot 5 (no library); whether the camera may collide
-  indoors, which it only needs to where there is no cutaway.
+- `Camera.lua` - the CVars the mode needs, for a session at a time; the
+  locked camera (library) or a saved camera view in slot 5 (no library);
+  whether the camera may collide indoors, which it only needs to where there
+  is no inside view.
 - `Input.lua` - one secure handler frame (`WotLKARPGMoveLock`) owns every
   override binding. Its restricted snippet rebuilds them from attributes, so
   the WASD toggle works in combat. Keys are looked up from the player's real
@@ -67,9 +73,11 @@ Found by testing in-game with CVars and bindings alone:
 - `Options.lua` - the panel under Interface > AddOns. Every control has a
   short label and a tooltip that says what it does in the game. Sliders hold
   whole numbers; one with a wide range snaps while dragged (the rotation
-  slider covers 360 values in some 260 pixels, so a drag alone could step
-  over 0), the mouse wheel moves any of them by one, and a right-click puts
-  it back to its default.
+  slider covers 360 values in well under 360 pixels, so a drag alone could
+  step over 0), the mouse wheel moves any of them by one, and a right-click
+  puts it back to its default. The panel the client gives an addon is about
+  400 units wide and 415 high whatever the UI scale, and nothing scrolls:
+  the layout is counted out to fit, with the camera sliders two to a row.
 - `Bindings.xml` - the mode toggle, the WASD toggle, and `WOTLKARPG_HOLDMOVE`,
   which the left mouse button is pointed at while the mode is on.
 
@@ -78,12 +86,39 @@ addon asks it for what it wants. The addon works without the library and
 finds out what is there from `ARPG_ClientVersion()`.
 
 Settings are kept for the whole account (`WotLKARPGDB`), and the mode is on
-by default, so a new character plays this way from its first login. Two
-things stay per character (`WotLKARPGCharDB`) because the client keeps what
-they describe per character: the CVar values to put back when the mode goes
-off, and whether the saved camera view holds the ARPG camera. Settings from
-0.2.1, which kept everything per character, are carried over by the first
-character to log in.
+by default, so a new character plays this way from its first login. One
+thing stays per character (`WotLKARPGCharDB`) because the client keeps what
+it describes per character: whether the saved camera view holds the ARPG
+camera. Settings from 0.2.1, which kept everything per character, are
+carried over by the first character to log in.
+
+### The game's own settings
+
+The mode needs seven CVars set its way: click-to-move on (`autointeract`,
+which the move the library issues goes through), the two camera following
+styles at "never", the maximum camera distance at 50, terrain tilt off,
+saved views snapping, and the sound listener at the camera. The client
+registers the first six per account (flag `0x10` in `0x00767FC0`). Per-account
+and per-character CVars are written to `config-cache.wtf` and, unless
+`synchronizeSettings` is off, sent to the server, which hands them to
+whichever client the account logs in from next. Up to 0.3.0 the mode's
+values stayed in place across logouts, so they were saved, and a normal
+client on the same account came up with click-to-move on and a camera that
+never follows.
+
+The client writes those caches in one place only: when the UI shuts down
+(logout, exit, reload), right after it raises `PLAYER_LOGOUT`
+(`0x00528F00`: the event at `0x00529025`, the caches from `0x0052908E`).
+So the mode's values are a session's: the player's own are noted in memory
+when the mode's go in, and put back when the mode is turned off and in the
+`PLAYER_LOGOUT` handler; the next login notes them afresh and applies the
+mode's again. Nothing is kept in the saved variables. After a crash the
+client has written nothing, so there is nothing to undo.
+
+A snapshot left in the saved variables by 0.3.0 or earlier is used once, at
+the first login: where a CVar still holds the mode's value, the snapshot has
+the player's own; where it holds anything else, the player has set it since,
+and that stands.
 
 Rules for addon work:
 
@@ -102,7 +137,7 @@ Rules for addon work:
 
 ## Client library
 
-`client/src`, about 2,300 lines of C++ with no dependencies: no Windows SDK, no
+`client/src`, about 2,600 lines of C++ with no dependencies: no Windows SDK, no
 C runtime, imports from `kernel32.dll` only. `client/build.sh` builds it with
 clang and lld on any OS.
 
@@ -111,7 +146,7 @@ clang and lld on any OS.
 | `game.h` | Every client address, offset and calling convention the library relies on |
 | `hook.cpp` | Guarded code patching |
 | `arpg.cpp` | Movement, the camera lock, the Lua functions, start-up |
-| `cutaway.cpp` | Buildings with their roofs off |
+| `cutaway.cpp` | Buildings shown from inside, and the cut |
 | `log.cpp` | `WotLK-ARPG.log` next to `Wow.exe` |
 | `crt.cpp`, `win.h` | The handful of runtime and Windows declarations a freestanding build needs |
 
@@ -157,7 +192,7 @@ AIO patcher or awesome_wotlk's patcher first.
 
 | Lua global | Purpose |
 |---|---|
-| `version, features = ARPG_ClientVersion()` | Its presence is how the addon detects the library. `features` is a bit set of the hooks that went in: 1 Lua functions, 2 hold-to-move, 4 camera angles, 8 camera distance, 16 the cutaway (all four of its hooks) |
+| `version, features = ARPG_ClientVersion()` | Its presence is how the addon detects the library. `features` is a bit set of the hooks that went in: 1 Lua functions, 2 hold-to-move, 4 camera angles, 8 camera distance, 16 the cutaway (all its hooks), 32 the cutaway shows buildings from inside (0.4.0; set together with 16) |
 | `ARPG_HoldStart()` / `ARPG_HoldStop()` | The move button went down / came up |
 | `ARPG_SetHoldInterval(ms)` | How often a held button re-issues the move (default 100, limits 10 to 2000) |
 | `ARPG_SetGroundClicks(maxRise)` | Move clicks that land more than `maxRise` yards above the character's feet go to the ground under the cursor. No argument: off |
@@ -166,8 +201,8 @@ AIO patcher or awesome_wotlk's patcher first.
 | `ARPG_SetCamera(yawDeg, pitchDeg, distance [, collide])` | Lock the camera. Yaw 0 looks north, positive turns counter-clockwise; pitch is degrees below the horizon (limit 89); distance in yards (2 to 200); `collide` lets walls shorten the distance |
 | `ARPG_SetCamera()` | Release the camera |
 | `asked, angleRuns, angleLocked, distanceRuns, distanceLocked = ARPG_CameraInfo()` | Whether a lock is asked for, how often the client has run its two camera routines since the UI loaded, and in how many of those runs the lock was applied. `/arpg status` shows it: a lock that is asked for but never applied is a bug |
-| `ARPG_SetCutaway(height [, elsewhere])` | Indoors, leave out everything more than `height` yards (2 to 30) above the character's feet. With `elsewhere` true, also cut whatever part of a building hides the character from the camera in the open or in a hall taller than the camera. No argument: off |
-| `asked, cutting, height, frames, framesCut, framesSkipped, rooms, indoors, blocked, refused, overhead, between = ARPG_CutawayInfo()` | What the cutaway is doing: whether a cut is on and how far above the feet; scene updates seen, drawn cut, and skipped because the device's matrices were not as expected; indoor rooms queued in the last cut frame; the client's own indoors test; whether a building blocks the view in the open; whether the library has given up because the renderer does not keep its projection; and how far overhead, and how high between camera and character, the building is (0 for none). `/arpg status` shows it |
+| `ARPG_SetCutaway(height [, outdoors])` | While the character is in a building, show the building from inside and nothing else, with whatever is more than `height` yards (2 to 30) above the character's feet left out. With `outdoors` true, also cut the world open wherever a building hides the character from the camera under the open sky. No argument: off |
+| `asked, cutting, height, frames, framesCut, framesSkipped, rooms, indoors, blocked, refused, overhead, between, inside, framesInside = ARPG_CutawayInfo()` | What the cutaway is doing: whether a cut is on and how far above the feet; scene updates seen, drawn cut, and skipped because the device's matrices were not as expected; rooms drawn in the last frame; whether the character is in a building (found there by the scene, or so says the client's indoors test); whether a building blocks the view in the open; whether the cut has been given up because the renderer does not keep its projection; how far overhead, and how high between camera and character, the building is (0 for none); whether the last frame was drawn from the character's room; and how many frames have been. `/arpg status` shows it |
 
 Functions added after 0.2.0 are detected by their presence, not by a feature
 bit.
@@ -243,74 +278,105 @@ Where there is no cutaway (switched off, an older library, or a renderer that
 refused it) the addon asks for collision while `IsIndoors()` is true (an
 option, on by default): a camera above a roof shows roof.
 
-**Cutaway.** A camera 20 yards up is fine in the open and useless under a
-roof. What an ARPG shows there is the room with its lid off. Four redirected
-calls in the client's frame make that picture.
+**Inside view.** A camera 20 yards up is fine in the open and useless under
+a roof: the client draws the roof. What an ARPG shows there is the room,
+looked into from above, and nothing else.
 
-The frame, as the client runs it (`0x004FAF90`): update the camera and set
-the device's view and projection from it (`0x00607CB0`); update the scene
-(`0x007831A0`), which works out the corners of the view from the device's
-matrices (`0x00795400`) and finds the building the camera stands in
-(`0x00795D40`); draw the scene (`0x0079A870`); put the device's matrices back.
+The client can already draw that picture, and in a few buildings it does so
+by accident (the Stormwind bank is one). When it takes the camera to be
+inside a building it draws from the camera's room outwards through the
+doorways (`0x007B3B20`, which judges each doorway with `0x007AD1F0`), and
+draws the outdoor world only as far as that walk came across doorways and
+windows to it. And the walls and ceilings of rooms are made to be seen from
+inside only, so a camera that is really above the roof looks straight
+through the roof and the near walls at the room. What "inside a building"
+means is a line straight down from the camera (`0x00795D40` asks
+`0x007D59B0`): if the first building surface under the camera belongs to an
+indoor group, the camera is in that group. Over the bank that is the bank's
+own ceiling. Over most buildings it is a roof that belongs to the outdoors,
+and the client draws the world as usual. Six redirected calls and one detour
+make the accident the rule wherever the character is in a room:
 
-- *The cut.* Everything above a level plane is clipped by making that plane
-  the near side of the view (Lengyel's oblique near-plane projection). With
-  the plane as `P` in view space (the world's downward direction turned by
-  the view matrix, and the plane's height less the camera's), the depth
-  column of the projection becomes `s*P - (0, 0, 1, 0)`, where `s` is chosen
-  so that the far corner of the view on the plane's side keeps its depth.
-  x, y and w come out as before, so nothing moves on screen. The Direct3D
-  device turns the engine's depth range of -w..w into 0..w when it takes a
-  projection (`0x006A9B40`); it does so by halving two of the four terms and
-  leaving the other two alone, so those two go in already halved, and the
-  library reads the hardware matrix back to see that the result is half the
-  scaled plane. The swap is made at `0x0079AB2F`, the last step before
-  drawing: the client decides what is in view from the corners of the view
-  volume, which an oblique projection would wreck, so it must not see the
-  changed matrix before then. The shaders are handed the new matrix
-  (`0x00872C10`); the model renderer sets itself up after that point and
-  takes the device's projection as it finds it, so models are cut at the
-  same plane with the same depth. The client's own restore at the end of the
-  frame undoes the swap.
-- *The rooms.* Indoor groups are drawn only when reached through doorways
-  from where the camera is, and a camera above the roof is nowhere. So the
-  library visits every indoor group in view itself, just before the client
-  goes through the visited groups (`0x0079AB2A`): it walks the list of placed
-  buildings (`0x00D25440`) and calls the client's own visit routine
-  (`0x00799310`) for each group that is placed, loaded, not an outdoor group,
-  at least partly under the plane and in view (`0x0078FB20`). The visit
-  queues the group, the scenery in it and the creatures in it. A group the
-  client has already visited is not queued twice; it only gains the whole
-  screen as a second window onto it.
-- *Outdoors, always.* With the camera inside some other room (the attic), the
-  client would draw from that room outwards and leave the outdoor world out.
-  The call that finds the camera's building (`0x00783381`) is replaced, while
-  a cut is on, by writing what that routine writes when it finds none.
+- *The room.* For the length of the one call that finds the camera's
+  building (`0x00783381`), the scene's camera position (`0x00CD8F5C`), which
+  that routine reads once at its start, holds the character's chest instead.
+  The answer is the room the character is in, or none under the open sky,
+  even while the camera itself hangs inside somebody's attic. The walk
+  through the doorways afterwards still judges each doorway from where the
+  camera really is, which leaves out the rooms between camera and character.
+- *Nothing else.* The walk leaves behind two rectangles of the screen
+  (`0x00ADF570`, `0x00ADF58C`) through which the sky and the outdoor world
+  show. Right after the walk (the call at `0x0079AA2C`) both are emptied the
+  way the client itself empties them, so it draws no sky and skips the
+  outdoor world. The screen is cleared to black (the call at `0x0079AB9A`).
+  Fog (`0x00873210`) would fade far walls to the colour of a sky that is not
+  there, starting from a camera that is a long way off: it fades to black,
+  and starts as far beyond the character as it would have beyond the camera.
+  The fog is a detour of its own and a matter of looks only.
+- *The rooms' contents.* The client shows the furniture and people of a room
+  next door only as far as its doorway frames them. Each group the walk
+  queued (`+0xB4` of the placed group) is visited once more (`0x00799310`)
+  with the whole screen as its frame, just before the client goes through
+  the visited groups (`0x0079AB2A`). A group already queued is not queued
+  twice; it only gains the second frame.
+- *The cut.* Beams, galleries and the floor of the storey above are solid
+  and face the camera. Everything above a level plane is clipped by making
+  that plane the near side of the view (Lengyel's oblique near-plane
+  projection). With the plane as `P` in view space (the world's downward
+  direction turned by the view matrix, and the plane's height less the
+  camera's), the depth column of the projection becomes `s*P - (0, 0, 1, 0)`,
+  where `s` is chosen so that the far corner of the view on the plane's side
+  keeps its depth. x, y and w come out as before, so nothing moves on
+  screen. The Direct3D device turns the engine's depth range of -w..w into
+  0..w when it takes a projection (`0x006A9B40`); it does so by halving two
+  of the four terms and leaving the other two alone, so those two go in
+  already halved, and the library reads the hardware matrix back to see that
+  the result is half the scaled plane. The swap is made at `0x0079AB2F`, the
+  last step before drawing: the client decides what is in view from the
+  corners of the view volume, which an oblique projection would wreck, so it
+  must not see the changed matrix before then. The shaders are handed the
+  new matrix (`0x00872C10`); the model renderer sets itself up after that
+  point and takes the device's projection as it finds it, so models are cut
+  at the same plane with the same depth. The client's own restore at the end
+  of the frame undoes the swap. This part ran in the game in 0.3.0.
 - *The cursor.* The hit test builds the cursor's ray from the camera
-  (`0x004F6450`, called at `0x004F9EC1`). The library moves the start of the
-  ray down to the plane, so clicks and hover go through what is not drawn.
-  The hit test sets the standard projection itself beforehand and unprojects
-  by way of the view's corners, which is one more reason the changed
-  projection lives only between the last step before drawing and the end of
-  the frame.
+  (`0x004F6450`, called at `0x004F9EC1`), and the roof and the near wall,
+  which are not on screen, would stop it. The ray is picked up again where
+  it comes through the cut, and then past every surface it meets (found
+  with the click's own test, flags `0x100151`) until it starts in a room
+  that is drawn, six surfaces at most. A point is in a drawn room if the
+  nearest building surface straight below it and the nearest straight above
+  it (`0x007D59B0` again) both belong to groups the walk reached. A ray that
+  never gets into one is left where the cut put it.
 
-When and where the cut is made is decided once a frame from three things:
-the client's own indoors test on the character (`0x0071B7F0`, what
-`IsIndoors()` uses), and two lines traced through the world against building
-surfaces only (`0x0077F310`, flags `0x70`): from the character's chest to the
-camera (from the chest, so that a parapet or a kerb is not "in the way"), and
-from the character's waist straight up.
+*The cut alone.* Where the lookup finds no room although the client's own
+indoors test (`0x0071B7F0`) says the character is in one, and outdoors when
+asked, the picture is 0.3.0's: the world is drawn as usual and cut at the
+plane. The scene is told the camera stands in no building, so that the
+outdoor world is drawn whatever attic the camera hangs in, and every indoor
+group in view and under the plane is visited (walking the list of placed
+buildings, `0x00D25440`), so that buildings sliced open are not empty. It is
+the rougher picture: whatever is taller than the cut loses its top, and
+buildings that are only a shell show it.
 
-- Indoors, under a roof lower than the camera: always. The cut is the set
+When and where the cut is made is decided once a frame, from the scene's
+lookup, the indoors test, and lines traced through the world against
+building surfaces only (`0x0077F310`, flags `0x70`): from the character's
+waist straight up and, outside the inside view, from the character's chest
+to the camera (from the chest, so that a parapet or a kerb is not "in the
+way").
+
+- In a room, under a roof lower than the camera: always. The cut is the set
   height over the character's feet. Under a ceiling lower than that it is
   just under the ceiling, down to 2 yards over the feet, because a ceiling
   above the cut lies over the room like a lid. In a room whose ceiling is
-  more than 3 yards over the set height it is just under whatever is lowest
-  overhead or between camera and character, so a tall room keeps its walls.
-- Indoors under a roof higher than the camera, and in the open: only if
-  asked, and only while part of a building stands between camera and
-  character for more than 150 ms; then just under the lowest part of it.
-  The cut ends 400 ms after the view clears.
+  more than 3 yards over the set height it is just under the ceiling, so a
+  tall room keeps its walls. In the inside view only straight up counts:
+  walls there do not hide what is behind them.
+- In a hall higher than the camera, seen from inside: not at all.
+- Under the open sky: only if asked, and only while part of a building
+  stands between camera and character for more than 150 ms; then just under
+  the lowest part of it. The cut ends 400 ms after the view clears.
 - Never closer than 3 yards over the feet (less only under a ceiling), and
   never with the camera less than a yard above the plane.
 - The plane slides: down from the camera when a cut begins, back up when it
@@ -321,23 +387,26 @@ from the character's waist straight up.
 - If the upward line finds nothing indoors, the place counts as enclosed:
   the basic cut does not depend on the trace behaving as read.
 
-What keeps a misreading of the client from doing damage: the projection is
-only replaced if it has exactly the shape the client builds for the world,
-the view matrix is a plain rotation, those two put the character on screen
-in front of the camera, and the camera looks down on the plane. If the device
-makes anything else of the matrix than expected, the standard one goes
-straight back; after three such frames the library gives up on the cutaway,
-says so, and the addon lets the camera collide indoors instead. The cutaway
-runs only with all four hooks in.
+What keeps a misreading of the client from doing damage. The inside view
+only ever asks the client's own routines the client's own questions and
+writes values the client writes itself; all six calls are redirected or the
+whole thing stays off. The projection is only replaced if it has exactly
+the shape the client builds for the world, the view matrix is a plain
+rotation, those two put the character on screen in front of the camera, and
+the camera looks down on the plane. If the device makes anything else of
+the matrix than expected, the standard one goes straight back; after three
+such frames the cut is given up, which the status says, and the inside view
+goes on without it.
 
-Known limits. The cut is one plane through the whole picture: a creature, a
-tree or a hillside taller than the cut loses its top while a cut is on.
-A wall stub right in front of the character still hides the legs. Where
-everything is clipped the background shows. Only building surfaces count as
-being in the way, so a ship's deck or a lift, which are game objects, is not
-seen by the two lines. Weather is drawn around the camera, which is outside.
-Possible next steps: exempt models from the cut (the device has clip planes
-of its own that only the model renderer uses), and fade instead of cut.
+Known limits. Rooms on the camera's side of the character's are not shown.
+A wall inside the room hides what is behind it, up to the cut. The cut is
+level and takes the tops off creatures taller than it. Only building
+surfaces count as overhead, so a ship's deck or a lift, which are game
+objects, is not seen by the upward line. Names of creatures outside may
+still be drawn over the black: not yet seen either way. Possible next
+steps: fade in and out instead of switching at the door, exempt models from
+the cut (the device has clip planes of its own that only the model renderer
+uses), and something better than slicing for the outdoors.
 
 **Lua functions.** The client registers its own functions at each UI load;
 the last block of them is registered by a routine ending at `0x00530F85`.
@@ -361,10 +430,12 @@ Four things stand in for the game, which CI cannot run:
    like the client: loads the UI, calls the Lua functions, runs frames, runs
    camera updates the way the client's own update routine does. For the
    cutaway it has a graphics device that converts a projection the way the
-   Direct3D one does, buildings laid out at the client's offsets, a world of
-   floors and ceilings for lines to run into, and a frame that goes through
-   the same steps in the same order; what was "drawn" is judged by putting
-   points through the matrices the device ended up with. It is built
+   Direct3D one does, buildings with rooms and doorways laid out at the
+   client's offsets, a world of floors, ceilings and walls for lines to run
+   into, and a frame that goes through the same steps in the same order:
+   the lookup of the camera's room, the walk through the doorways, the
+   outdoor world or not, the clear, the fog; what was "drawn" is judged by
+   putting points through the matrices the device ended up with. It is built
    twice: as a 32-bit Linux program with the library compiled in
    (`client/test/run.sh`), and as a Windows program that loads the real DLL
    (`mock-client.exe`, run by CI on Windows). It is only as good as its
@@ -375,9 +446,9 @@ Four things stand in for the game, which CI cannot run:
 
 Each rule of the cutaway is also broken on purpose, one at a time, to see
 that a test notices (`client/test/mutation_test.py`, a few minutes, run by
-hand): 38 breakages, from "the sideways depth term is not halved" to "the
-pause before the plane rises is gone". Several were not noticed at first,
-and the tests were extended until they all were.
+hand): 64 breakages, from "the sideways depth term is not halved" to "the
+window onto the sky is left open". Several were not noticed at first, and
+the tests were extended until they all were.
 
 None of this shows that the real client behaves like the mock. That takes
 the game.
@@ -423,11 +494,19 @@ at `0x00400000`.
 | Projection to the shaders | `0x00872C10` | cdecl, no arguments; from the hardware matrix. 14 callers, the model renderer among them (`0x008230D0`, `0x00823130`) |
 | Scene update | `0x007831A0` | view corners `0x00795400` (from the device's matrices, by `0x006BF6D0`), then the camera's building `0x00795D40`, called at `0x00783381` |
 | Scene camera position | `0x00CD8F5C` | Vec3 |
-| Camera's building, if inside one | `*0x00CD87A4` | null outdoors; a second at `0x00CD87A0`, group counts at `0x00CDB0D8` and `0x00CDB0E8` |
+| Camera's building, if inside one | `*0x00CD87A4` | null outdoors; a second at `0x00CD87A0`, group lists at `0x00CDB0D4` and `0x00CDB0E4` with their counts at `+4`. Found by `0x00795D40`: a line 1760 yards straight down from the scene camera position, read once at the start, put to `0x007D59B0` |
+| Building group on a line | `0x007D59B0` | cdecl: Vec3* from, Vec3* to, float fraction (how far along counts), void* buildings[2], uint32 groups[4]. The group whose surface the line meets first; false if nothing, or if that group is an outdoor one. Takes any line |
+| Walk from the camera's rooms | `0x007B3B20` | thiscall on the placed building: the group list. Called at `0x0079AA2C`. Judges each doorway from the scene camera position (`0x007AD1F0`) |
+| Windows onto the outdoors | `0x00ADF570`, `0x00ADF58C` | each: left, top, right, bottom as fractions of the screen, then a depth that is below zero when nothing shows. Emptied (FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -1) in the scene update and again before the walk. After the walk the first decides sky, clear colour, weather and light; the second goes to the outdoor culling (`0x0079A790`), skipped if empty |
+| Screen clear in the scene draw | `0x006813B0`, called at `0x0079AB9A` | cdecl: what (3), colour. The colour is the sky's or the fog's, by the first window |
+| Fog for what is drawn next | `0x00873210` | cdecl: float start, float end, float density, uint32* colour (0xAARRGGBB). Buildings and models set theirs through it; terrain does not |
+| World switches | `0x00CD774C` | bit `0x100` clear: no buildings drawn, tested or looked up |
 | Scene draw | `0x0079A870` | cdecl. Finds what is in view (from the camera's building through doorways, `0x007AD1F0`, or the outdoor world), then `0x0079A260` (scenery and creatures of the visited groups, called at `0x0079AB2A`), `0x00793450` (called at `0x0079AB2F`), clears, sets up the model renderer, hands the projection to the shaders, draws (`0x007964A0`) |
-| Visit a building group | `0x00799310` | cdecl: group index, placed building. Queues the group once per frame and adds the view on top of the scene's stack as a window onto it. Needs the group's data loaded: no check. Reads `0x00CFBEB8` |
+| Visit a building group | `0x00799310` | cdecl: group index, placed building. Queues the group once per frame (`+0xB4` of the placed group is nonzero while it is queued) and adds the view on top of the scene's stack as a window onto it. Needs the group's data loaded: no check. Reads `0x00CFBEB8` |
 | Box outside the view | `0x0078FB20` | cdecl: Box*; nonzero if wholly outside |
 | Placed buildings | list head `0x00D25440`, link offset at `0x00D25438` | per building: flags `+0x0C` (`0x80` groups placed), bounds `+0x48`, model `+0xF4`, group links `+0x11C`, placed groups by index `+0x120`..`+0x130`. Placed group: bounds `+0x24`, index `+0x50`. Model: group records `+0x130` (0x20 bytes each, flags first), count `+0x16C`, loaded `+0x1E0`, group data `+0x1F8` (loaded bit at `+0x198` of each) |
+| UI shutdown | `0x00528F00` | logout, exit and reload. Raises `PLAYER_LOGOUT` (event `0xFE`, `0x0081B530`) at `0x00529025`, then writes the saved settings: bindings, macros, and from `0x0052908E` the CVar caches, each through `0x006B9BE0` (type, writer, argument), which writes the file and then (`0x006B9440`) sends it to the server unless `synchronizeSettings` is 0. The writer for CVars (`0x00512890` -> `0x007670E0`) has no other caller |
+| Register a CVar | `0x00767FC0` | cdecl: name, help, flags, default, callback, category, ... Flag `0x10`: saved per account; `0x20`: per character. Event names are a table at `0x00C24EB0` |
 | Lua state creation and registration | `0x0052A980` | sets up the UI's scripting (`0x0081A9A0`), then calls `0x005120E0`, which registers the client's functions. Two callers |
 | Register a Lua function | `0x00817F90` | cdecl: name, function |
 | Last block of the client's Lua registrations | `0x00530F60` | ends in `ret` at `0x00530F85`; tail-called from `0x005120E0` |
