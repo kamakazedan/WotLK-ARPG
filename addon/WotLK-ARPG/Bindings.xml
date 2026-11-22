@@ -5,4 +5,9 @@
 	<!-- Clicks the secure button directly, so this one also works in combat. -->
 	<Binding name="CLICK WotLKARPGMoveLock:LeftButton">
 	</Binding>
+	<!-- The left mouse button is pointed here while the mode is on and the
+	     client library is loaded. runOnUp: the body runs on press and release. -->
+	<Binding name="WOTLKARPG_HOLDMOVE" runOnUp="true">
+		WotLKARPG_HoldMove(keystate);
+	</Binding>
 </Bindings>

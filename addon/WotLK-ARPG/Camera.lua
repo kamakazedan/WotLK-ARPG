@@ -1,10 +1,11 @@
 --[[
-    Camera.lua: the CVars the mode needs, and the saved camera view.
+    Camera.lua: the CVars the mode needs, and the camera itself.
 
-    Without the client library the camera is only "parked": it stops following
-    the character and its zoom is locked, but the stock client cannot pin its
-    compass direction or stop it colliding with walls. Those come from the
-    client library (see docs/DESIGN.md).
+    With the client library the camera is locked to a set direction, angle
+    and distance (ARPG_SetCamera), and nothing the mouse or the game does can
+    move it. Without the library the camera can only be "parked": it stops
+    following the character, its zoom keys are disabled and a saved view is
+    restored, but dragging the mouse still turns it.
 ]]
 
 local ADDON, ns = ...
@@ -14,7 +15,7 @@ ns.VIEW_SLOT = 5 -- which of the client's saved camera views holds the ARPG came
 -- CVar values while the mode is on. The originals are snapshotted in the
 -- saved variables and put back when the mode is turned off.
 local CVARS = {
-    { "autointeract", "1" },              -- click-to-move
+    { "autointeract", "1" },              -- click-to-move (hold-to-move builds on it)
     { "cameraSmoothStyle", "0" },         -- camera following style: never
     { "cameraSmoothTrackingStyle", "0" }, -- click-to-move camera style: never
     { "cameraDistanceMax", "50" },        -- room for a high top-down camera
@@ -65,7 +66,45 @@ function ns:RestoreCVars()
     self.db.savedCVars = nil
 end
 
+---------------------------------------------------------------------------
+-- Locked camera (client library)
+---------------------------------------------------------------------------
+
+-- Until buildings can be cut away, an indoor camera that ignores walls would
+-- sit above the roof looking at tiles. Indoors it may collide instead.
+function ns:WantsCollision()
+    return (self.db.indoorCollision and IsIndoors()) and true or false
+end
+
+-- Locks or releases the camera to match the settings. Safe to call at any
+-- time, including in combat.
+function ns:ApplyClientCamera()
+    if not self:ClientCanLockCamera() then
+        self.cameraLocked = nil
+        return
+    end
+    local db = self.db
+    if db.enabled and not self.cameraEdit then
+        self.cameraCollides = self:WantsCollision()
+        self.cameraLocked = true
+        ARPG_SetCamera(db.camYaw, db.camPitch, db.camDistance, self.cameraCollides)
+    else
+        self.cameraLocked = nil
+        ARPG_SetCamera() -- release
+    end
+end
+
+---------------------------------------------------------------------------
+-- Saved view (no client library)
+---------------------------------------------------------------------------
+
 function ns:ApplyCamera(verbose)
+    if self:ClientCanLockCamera() then
+        if verbose then
+            ns.Print("The camera is locked by the client library. Change it with /arpg options.")
+        end
+        return
+    end
     if not self.db.hasView then
         if verbose then
             ns.Print("No camera saved yet: /arpg camedit, set it up, then /arpg savecam.")
@@ -77,6 +116,10 @@ function ns:ApplyCamera(verbose)
 end
 
 function ns:SaveCamera()
+    if self:ClientCanLockCamera() then
+        ns.Print("With the client library the camera is set in /arpg options, not saved from a view.")
+        return
+    end
     SaveView(self.VIEW_SLOT)
     self.db.hasView = true
     ns.Print("Camera saved. /arpg cam snaps back to it at any time.")
@@ -85,8 +128,8 @@ function ns:SaveCamera()
     end
 end
 
--- Camera edit hands the mouse buttons and the scroll wheel back to the
--- client, so the camera can be zoomed and turned into place.
+-- Camera edit hands the camera, the mouse buttons and the scroll wheel back
+-- to the client: to look around, or to set up a view to save.
 function ns:SetCameraEdit(on)
     if on and not self.db.enabled then
         ns.Print("Turn the mode on first (/arpg).")
@@ -94,11 +137,13 @@ function ns:SetCameraEdit(on)
     end
     self.cameraEdit = on or nil
     if not self:Sync() then
-        return -- in combat: applies afterwards
+        return -- in combat: finishes afterwards
     end
-    if on then
-        ns.Print("Camera edit: scroll to zoom, hold the left mouse button to turn and tilt, then /arpg savecam.")
-    else
+    if not on then
         ns.Print("Camera locked.")
+    elseif self:ClientCanLockCamera() then
+        ns.Print("Camera free: scroll to zoom, hold the left mouse button to look around. /arpg camedit again to lock it.")
+    else
+        ns.Print("Camera edit: scroll to zoom, hold the left mouse button to turn and tilt, then /arpg savecam.")
     end
 end

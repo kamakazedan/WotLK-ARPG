@@ -96,11 +96,13 @@ local function setKeyList(name, keys)
     end
 end
 
--- What the left mouse button does in the world. TURNORACTION is the client's
--- own click-to-move action: one click, one move. The client library replaces
--- it with hold-to-move.
+-- What the left mouse button does in the world. With the client library it is
+-- this addon's own binding (see WotLKARPG_HoldMove in Core.lua): press to
+-- move or interact, hold to keep moving, and the camera never turns.
+-- Without it, TURNORACTION is the client's click-to-move action: one click,
+-- one move, and holding the button turns the camera.
 function ns:LeftButtonCommand()
-    return "TURNORACTION"
+    return self:ClientCanHoldMove() and "WOTLKARPG_HOLDMOVE" or "TURNORACTION"
 end
 
 -- True when the player has rebound a movement or camera key since the last
