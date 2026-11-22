@@ -107,8 +107,27 @@ function Write-Name([string]$path, [int]$offset, [byte[]]$bytes) {
     }
 }
 
-function Get-Sha256([string]$path) {
-    return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+# SHA-256 as text, of bytes in memory and of a file. Done with .NET directly:
+# Windows PowerShell loses its Get-FileHash command when it is started from a
+# PowerShell 7 session, and this script must work from anywhere.
+function Get-BytesHash([byte[]]$bytes) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString($sha.ComputeHash($bytes))
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-FileHashText([string]$path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($path)
+    try {
+        return [BitConverter]::ToString($sha.ComputeHash($stream))
+    } finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
 }
 
 # --- find and check the executable -----------------------------------------
@@ -204,15 +223,11 @@ try {
 
 # Read it back: the file must be what it was, with the new name in place.
 [Array]::Copy($newBytes, 0, $data, $nameOffset, $NameSize)
-[byte[]]$check = [System.IO.File]::ReadAllBytes($exePath)
-$same = $check.Length -eq $data.Length
-if ($same) {
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $same = [BitConverter]::ToString($sha.ComputeHash($check)) -eq [BitConverter]::ToString($sha.ComputeHash($data))
-    } finally {
-        $sha.Dispose()
-    }
+$same = $false
+try {
+    $same = (Get-FileHashText $exePath) -eq (Get-BytesHash $data)
+} catch {
+    $same = $false
 }
 if (-not $same) {
     try { Write-Name $exePath $nameOffset $oldBytes } catch { }
@@ -227,8 +242,12 @@ if (-not $same) {
 Write-Host ''
 if ($Uninstall) {
     Write-Host "Done. Wow.exe loads $StockName again." -ForegroundColor Green
-    if ((Test-Path -LiteralPath $backupPath) -and ((Get-Sha256 $exePath) -eq (Get-Sha256 $backupPath))) {
-        Write-Host 'It is byte for byte the file it was before the install.'
+    try {
+        if ((Test-Path -LiteralPath $backupPath) -and ((Get-FileHashText $exePath) -eq (Get-FileHashText $backupPath))) {
+            Write-Host 'It is byte for byte the file it was before the install.'
+        }
+    } catch {
+        # Only a remark: the uninstall itself is done and verified.
     }
     Write-Host "You can delete $OurName, WotLK-ARPG.log and Wow.exe.before-WotLK-ARPG."
 } else {

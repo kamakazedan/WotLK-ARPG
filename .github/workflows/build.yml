@@ -89,5 +89,13 @@ jobs:
           if exist WotLK-ARPG.log (type WotLK-ARPG.log) else (echo no log was written)
           exit /b %RESULT%
 
-      - name: Test the setup script (Windows PowerShell 5.1 and PowerShell 7, and the .bat files)
+      # Twice, because the two ways of getting to Windows PowerShell differ:
+      # started from a PowerShell 7 session it inherits that session's module
+      # path and loses some of its own commands.
+      - name: Test the setup script, started from PowerShell 7 (Windows PowerShell 5.1, PowerShell 7, the .bat files)
+        shell: pwsh
         run: python client/test/installer_test.py
+
+      - name: Test the setup script, started from cmd as a double-click would (Windows PowerShell 5.1, the .bat files)
+        shell: cmd
+        run: python client/test/installer_test.py --shell powershell

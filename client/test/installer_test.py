@@ -335,7 +335,10 @@ def test_next_to_the_game(runner, results, root):
             done = subprocess.run(["cmd", "/c", os.path.join(folder, batch)], stdin=subprocess.DEVNULL,
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=tempfile.gettempdir(),
                                   timeout=300)
-            results.check(read(exe) == expected, what, done.stdout.decode("utf-8", "replace"))
+            output = done.stdout.decode("utf-8", "replace")
+            results.check(read(exe) == expected, what, output)
+            results.check("Done." in output and "CategoryInfo" not in output, "and reports success without errors",
+                          output)
 
 
 def run_all(runner):
