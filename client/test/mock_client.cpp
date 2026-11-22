@@ -181,7 +181,13 @@ int g_followed = 0;  // what the camera follows; only its address matters
 
 constexpr int kFrameResult = 0x5150;
 constexpr int kRegistrationResult = 0x1234;
-constexpr uint32_t kCollisionResult = 0x77;
+constexpr uint32_t kCollisionResult = 0x7F;  // includes the first-person bit, to see who lets it through
+uint32_t g_collisionReturn = kCollisionResult;
+
+// The mock camera's "matrix": just the angles it was last built from, kept
+// where the real camera keeps its matrix.
+constexpr size_t kMockMatrixYaw = 0x14;
+constexpr size_t kMockMatrixPitch = 0x18;
 constexpr float kMockYaw = 1.0f;
 constexpr float kMockPitch = 0.5f;
 constexpr float kMockRoll = 0.25f;
@@ -194,15 +200,32 @@ struct FrameCalls {
 };
 FrameCalls g_frame;
 
+// What the next capture "finds" under the cursor.
+struct CursorScene {
+    int kind;
+    game::Vec3 hit;
+    game::Vec3 rayStart;
+    game::Vec3 rayEnd;
+    uint32_t guidLow;
+    uint32_t guidHigh;
+};
+CursorScene g_cursor;
+
 struct ClickCalls {
     int captures;
     int performs;
     int lastButton;
     uint8_t* captureFrame;
     uint8_t* performFrame;
-    int nextKind;  // what the next capture "finds" under the cursor
+    game::Vec3 performPosition;  // the hit position the click handler would have acted on
 };
 ClickCalls g_click;
+
+struct TerrainClicks {
+    int count;
+    game::TerrainClick last;
+};
+TerrainClicks g_terrain;
 
 struct MatrixCalls {
     int count;
@@ -241,6 +264,18 @@ struct Registration {
 Registration g_registered[64];
 int g_registeredCount = 0;
 
+// The player's character: an object whose virtual table has the position
+// routine in the client's slot.
+constexpr uint64_t kMockPlayerGuid = 0x0000000700001234ull;
+uint64_t g_playerGuid = kMockPlayerGuid;  // zero: not in the world
+game::Vec3 g_playerPosition = {100.0f, 200.0f, 10.0f};
+void* g_playerVirtuals[32];
+struct MockObject {
+    void** virtuals;
+};
+MockObject g_player = {g_playerVirtuals};
+uint32_t g_lookupTypeMask = 0;
+
 // The Lua stack as the library's functions see it.
 constexpr int LUA_TBOOLEAN = 1;
 struct MockLua {
@@ -250,7 +285,8 @@ struct MockLua {
     int booleans[4];
     int pushes;
     const char* pushedString;
-    double pushedNumber;
+    double pushedNumbers[8];
+    int pushedNumberCount;
 };
 MockLua g_lua;
 
@@ -271,14 +307,41 @@ int __cdecl MockFrameHandler(int a1, int a2, int a3, int a4) {
 void __fastcall MockCapture(uint8_t* worldFrame) {
     ++g_click.captures;
     g_click.captureFrame = worldFrame;
-    game::At<int>(worldFrame, game::kWorldFrameHitKind) = g_click.nextKind;
+    game::At<int>(worldFrame, game::kWorldFrameHitKind) = g_cursor.kind;
+    game::At<uint32_t>(worldFrame, game::kWorldFrameHitGuid) = g_cursor.guidLow;
+    game::At<uint32_t>(worldFrame, game::kWorldFrameHitGuid + 4) = g_cursor.guidHigh;
+    game::At<game::Vec3>(worldFrame, game::kWorldFrameHitPosition) = g_cursor.hit;
+    game::At<game::Vec3>(worldFrame, game::kWorldFrameRayStart) = g_cursor.rayStart;
+    game::At<game::Vec3>(worldFrame, game::kWorldFrameRayEnd) = g_cursor.rayEnd;
 }
 
 int __fastcall MockPerform(uint8_t* worldFrame, void*, int button) {
     ++g_click.performs;
     g_click.performFrame = worldFrame;
     g_click.lastButton = button;
+    g_click.performPosition = game::At<game::Vec3>(worldFrame, game::kWorldFrameHitPosition);
     return 1;
+}
+
+int __cdecl MockTerrainClick(const game::TerrainClick* click) {
+    ++g_terrain.count;
+    g_terrain.last = *click;
+    return 1;
+}
+
+uint64_t __cdecl MockPlayerGuid() {
+    return g_playerGuid;
+}
+
+void* __cdecl MockObjectByGuid(uint32_t low, uint32_t high, uint32_t typeMask, const char* file, int) {
+    g_lookupTypeMask = typeMask;
+    const uint64_t guid = (static_cast<uint64_t>(high) << 32) | low;
+    return guid == kMockPlayerGuid && file != nullptr ? &g_player : nullptr;
+}
+
+game::Vec3* __fastcall MockGetPosition(void*, void*, game::Vec3* out) {
+    *out = g_playerPosition;
+    return out;
 }
 
 void __fastcall MockBuildMatrix(void* camera, void*, float yaw, float pitch, float roll) {
@@ -287,8 +350,12 @@ void __fastcall MockBuildMatrix(void* camera, void*, float yaw, float pitch, flo
     g_matrix.yaw = yaw;
     g_matrix.pitch = pitch;
     g_matrix.roll = roll;
+    game::At<float>(camera, kMockMatrixYaw) = yaw;
+    game::At<float>(camera, kMockMatrixPitch) = pitch;
 }
 
+// Like the real routine: reports the client's own angles and, if the camera
+// follows something, builds the matrix from them.
 void __fastcall MockOrientation(void* camera, void*, void* target, float* yaw, float* pitch, float* roll) {
     ++g_orientation.count;
     g_orientation.camera = camera;
@@ -296,10 +363,15 @@ void __fastcall MockOrientation(void* camera, void*, void* target, float* yaw, f
     *yaw = kMockYaw;
     *pitch = kMockPitch;
     *roll = kMockRoll;
+    if (target != nullptr) {
+        game::At<float>(camera, kMockMatrixYaw) = kMockYaw;
+        game::At<float>(camera, kMockMatrixPitch) = kMockPitch;
+    }
 }
 
-// Like the real routine: starts from the camera's wanted zoom, and returns it
-// untouched if the no-collision flag is set; otherwise something is in the way.
+// Like the real routine: starts from the larger of the camera's zoom fields,
+// and returns that untouched if the first-person flag is set; otherwise
+// something is in the way.
 uint32_t __fastcall MockCollision(void* camera, void*, float* target, float* distance, float* height, float* offset,
                                   float scale, float* fraction) {
     ++g_collision.count;
@@ -311,11 +383,12 @@ uint32_t __fastcall MockCollision(void* camera, void*, float* target, float* dis
     g_collision.zoomBlend = game::At<float>(camera, game::kCameraZoomBlend);
     g_collision.flags = game::At<uint32_t>(camera, game::kCameraFlags);
 
-    const bool free = (g_collision.flags & game::kCameraFlagNoCollision) != 0;
-    *distance = free || g_collision.zoom < kObstacleDistance ? g_collision.zoom : kObstacleDistance;
+    const float wanted = g_collision.zoom > g_collision.zoomBlend ? g_collision.zoom : g_collision.zoomBlend;
+    const bool firstPerson = (g_collision.flags & game::kCameraFlagFirstPerson) != 0;
+    *distance = firstPerson || wanted < kObstacleDistance ? wanted : kObstacleDistance;
     *height = kMockHeight;
     *fraction = 1.0f;
-    return kCollisionResult;
+    return g_collisionReturn;
 }
 
 void __cdecl MockRegisterGameFunctions() {
@@ -352,7 +425,9 @@ int __cdecl MockToBoolean(game::lua_State*, int index) {
 
 void __cdecl MockPushNumber(game::lua_State*, double value) {
     ++g_lua.pushes;
-    g_lua.pushedNumber = value;
+    if (g_lua.pushedNumberCount < 8) {
+        g_lua.pushedNumbers[g_lua.pushedNumberCount++] = value;
+    }
 }
 
 void __cdecl MockPushString(game::lua_State*, const char* value) {
@@ -400,6 +475,7 @@ bool AddressesFit() {
         game::kLuaGetTop,            game::kLuaType,               game::kLuaToNumber,
         game::kLuaToBoolean,         game::kLuaPushNumber,         game::kLuaPushString,
         game::kFrameHandler,         game::kCameraOrientation,     game::kCameraCollision,
+        game::kPlayerGuid,           game::kObjectByGuid,          game::kTerrainClick,
         kRegistrationRoutine,
     };
     for (uintptr_t address : addresses) {
@@ -448,6 +524,9 @@ void BuildClient() {
     // Everything the library only calls is a jump to its mock.
     JumpAt(game::kCaptureDefaultAction, CodeAddress(MockCapture));
     JumpAt(game::kPerformDefaultAction, CodeAddress(MockPerform));
+    JumpAt(game::kTerrainClick, CodeAddress(MockTerrainClick));
+    JumpAt(game::kPlayerGuid, CodeAddress(MockPlayerGuid));
+    JumpAt(game::kObjectByGuid, CodeAddress(MockObjectByGuid));
     JumpAt(game::kBuildCameraMatrix, CodeAddress(MockBuildMatrix));
     JumpAt(game::kRegisterLuaFunction, CodeAddress(MockRegisterLuaFunction));
     JumpAt(game::kLuaGetTop, CodeAddress(MockGetTop));
@@ -456,6 +535,7 @@ void BuildClient() {
     JumpAt(game::kLuaToBoolean, CodeAddress(MockToBoolean));
     JumpAt(game::kLuaPushNumber, CodeAddress(MockPushNumber));
     JumpAt(game::kLuaPushString, CodeAddress(MockPushString));
+    g_playerVirtuals[game::kObjectVirtualGetPosition] = reinterpret_cast<void*>(CodeAddress(MockGetPosition));
 
     // The world: in it, with a world frame whose active camera is g_camera.
     Fixed<uint8_t>(game::kInWorldFlag) = 1;
@@ -468,14 +548,21 @@ void BuildClient() {
 // Doing what the client does
 // ---------------------------------------------------------------------------
 
+// A camera in its normal state in the world: set up on its target, plus some
+// flag the library has no business with.
 constexpr uint32_t kCameraFlagUnrelated = 0x100;
+constexpr uint32_t kClientFlags = game::kCameraFlagInitialized | kCameraFlagUnrelated;
 constexpr float kClientZoom = 12.0f;
 constexpr float kClientZoomBlend = 11.0f;
 
 void ResetCamera(uint8_t* camera) {
-    game::At<uint32_t>(camera, game::kCameraFlags) = kCameraFlagUnrelated;
+    game::At<uint32_t>(camera, game::kCameraFlags) = kClientFlags;
     game::At<float>(camera, game::kCameraZoom) = kClientZoom;
     game::At<float>(camera, game::kCameraZoomBlend) = kClientZoomBlend;
+}
+
+uint32_t CameraFlags(uint8_t* camera) {
+    return game::At<uint32_t>(camera, game::kCameraFlags);
 }
 
 game::lua_State* LuaState() {
@@ -486,7 +573,7 @@ void LuaClear() {
     g_lua.top = 0;
     g_lua.pushes = 0;
     g_lua.pushedString = nullptr;
-    g_lua.pushedNumber = 0.0;
+    g_lua.pushedNumberCount = 0;
 }
 
 void LuaPushNumber(double value) {
@@ -530,12 +617,18 @@ int CallLua(const char* name) {
     return static_cast<int>(results);
 }
 
-void SetCamera(double yaw, double pitch, double distance) {
+// Calls a registered function with up to three numbers.
+int CallLuaWith(const char* name, int count, double a = 0.0, double b = 0.0, double c = 0.0) {
+    const double values[] = {a, b, c};
     LuaClear();
-    LuaPushNumber(yaw);
-    LuaPushNumber(pitch);
-    LuaPushNumber(distance);
-    CallLua("ARPG_SetCamera");
+    for (int i = 0; i < count; ++i) {
+        LuaPushNumber(values[i]);
+    }
+    return CallLua(name);
+}
+
+void SetCamera(double yaw, double pitch, double distance) {
+    CallLuaWith("ARPG_SetCamera", 3, yaw, pitch, distance);
 }
 
 void SetCameraColliding(double yaw, double pitch, double distance) {
@@ -548,24 +641,19 @@ void SetCameraColliding(double yaw, double pitch, double distance) {
 }
 
 void ReleaseCamera() {
-    LuaClear();
-    CallLua("ARPG_SetCamera");
+    CallLuaWith("ARPG_SetCamera", 0);
 }
 
 void SetHoldInterval(double milliseconds) {
-    LuaClear();
-    LuaPushNumber(milliseconds);
-    CallLua("ARPG_SetHoldInterval");
+    CallLuaWith("ARPG_SetHoldInterval", 1, milliseconds);
 }
 
 void Press() {
-    LuaClear();
-    CallLua("ARPG_HoldStart");
+    CallLuaWith("ARPG_HoldStart", 0);
 }
 
 void Release() {
-    LuaClear();
-    CallLua("ARPG_HoldStop");
+    CallLuaWith("ARPG_HoldStop", 0);
 }
 
 struct Angles {
@@ -602,6 +690,82 @@ Distance Collision(void* camera) {
     return result;
 }
 
+float Sine(float angle) {
+    float result;
+    __asm__("fsin" : "=t"(result) : "0"(angle));
+    return result;
+}
+
+float Cosine(float angle) {
+    float result;
+    __asm__("fcos" : "=t"(result) : "0"(angle));
+    return result;
+}
+
+// One camera update, step for step as the client's own routine does it
+// (0x00606F90 in the 12340 executable): set the camera up if it is not yet,
+// get the angles, get the distance, take the flag bits the distance routine
+// returns, drop to first person if that bit is now set, place the camera
+// behind the pivot along the matrix's forward axis, and note a collision if
+// the camera ended up closer than its zoom.
+constexpr uint32_t kCameraFlagsClearedPerUpdate = 0x30000;
+constexpr uint32_t kCameraFlagKeepDistance = 0x40000000;
+constexpr uint32_t kCameraFlagCollisionBlend = 0x4000000;
+constexpr float kCollisionBlendThreshold = 0.111111f;
+constexpr float kCollisionBlendMargin = 0.111112f;
+constexpr float kFirstPersonZoom = 1.8315f;  // below this zoom the client treats the view as first person
+
+void ClientCameraUpdate(uint8_t* camera, void* target) {
+    uint32_t& flags = game::At<uint32_t>(camera, game::kCameraFlags);
+    flags |= game::kCameraFlagInitialized;
+
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    float roll = 0.0f;
+    int popped = 0;
+    const uint32_t angleArguments[] = {Address(target), Address(&yaw), Address(&pitch), Address(&roll)};
+    CallClient(game::kCameraOrientation, camera, angleArguments, 4, &popped);
+
+    flags &= ~kCameraFlagsClearedPerUpdate;
+    float pivot[3] = {g_playerPosition.x, g_playerPosition.y, g_playerPosition.z};
+    float offset[3] = {0.0f, 0.0f, 0.0f};
+    float distance = 0.0f;
+    float height = 0.0f;
+    float fraction = 0.0f;
+    const uint32_t distanceArguments[] = {Address(pivot),  Address(&distance),     Address(&height),
+                                          Address(offset), Bits(kCollisionScale), Address(&fraction)};
+    flags |= CallClient(game::kCameraCollision, camera, distanceArguments, 6, &popped);
+    if ((flags & game::kCameraFlagFirstPerson) != 0 && (flags & kCameraFlagKeepDistance) == 0) {
+        distance = 0.0f;
+    }
+
+    const float matrixYaw = game::At<float>(camera, kMockMatrixYaw);
+    const float matrixPitch = game::At<float>(camera, kMockMatrixPitch);
+    game::Vec3& position = game::At<game::Vec3>(camera, game::kCameraPosition);
+    position.x = pivot[0] - Cosine(matrixYaw) * Cosine(matrixPitch) * distance;
+    position.y = pivot[1] - Sine(matrixYaw) * Cosine(matrixPitch) * distance;
+    position.z = pivot[2] + height + Sine(matrixPitch) * distance;
+
+    float& zoom = game::At<float>(camera, game::kCameraZoom);
+    if (zoom - distance > kCollisionBlendThreshold) {
+        flags |= kCameraFlagCollisionBlend;
+        zoom = distance + kCollisionBlendMargin;
+    }
+}
+
+bool ClientSeesFirstPerson(uint8_t* camera) {
+    return game::At<float>(camera, game::kCameraZoom) < kFirstPersonZoom;
+}
+
+// Where a camera at these angles and this distance from the character is.
+game::Vec3 CameraSpot(float yawDegrees, float pitchDegrees, float distance) {
+    const float yaw = yawDegrees * 0.017453292f;
+    const float pitch = pitchDegrees * 0.017453292f;
+    return {g_playerPosition.x - Cosine(yaw) * Cosine(pitch) * distance,
+            g_playerPosition.y - Sine(yaw) * Cosine(pitch) * distance,
+            g_playerPosition.z + kMockHeight + Sine(pitch) * distance};
+}
+
 constexpr int kFrameArguments[3] = {11, 22, 33};
 constexpr float kFrameElapsed = 0.016f;
 
@@ -623,12 +787,50 @@ void WaitForRepeat() {
     platform::Sleep(60);
 }
 
+// The cursor's ray, as seen from a camera high up to the south looking down
+// to the north at 45 degrees. The character stands at (100, 200, 10); the
+// ray comes down to the height of its feet at (110, 200).
+constexpr game::Vec3 kRayStart = {70.0f, 200.0f, 50.0f};
+constexpr game::Vec3 kRayEnd = {170.0f, 200.0f, -50.0f};
+constexpr game::Vec3 kGroundUnderCursor = {110.0f, 200.0f, 10.0f};
+constexpr game::Vec3 kRoofUnderCursor = {90.0f, 200.0f, 30.0f};   // 20 above the feet, on the same ray
+constexpr game::Vec3 kStepUnderCursor = {108.0f, 200.0f, 12.0f};  // 2 above the feet, on the same ray
+
+void PointCursorAt(int kind, const game::Vec3& hit) {
+    g_cursor.kind = kind;
+    g_cursor.hit = hit;
+    g_cursor.rayStart = kRayStart;
+    g_cursor.rayEnd = kRayEnd;
+    g_cursor.guidLow = 0;
+    g_cursor.guidHigh = 0;
+}
+
+void CheckPosition(const game::Vec3& actual, const game::Vec3& expected, const char* what) {
+    float worst = 0.0f;
+    const float differences[] = {actual.x - expected.x, actual.y - expected.y, actual.z - expected.z};
+    for (float difference : differences) {
+        const float size = difference < 0.0f ? -difference : difference;
+        worst = size > worst ? size : worst;
+    }
+    Check(worst < 0.01f, what);
+    if (worst >= 0.01f) {
+        Print("          got (");
+        PrintNumber(Thousandths(actual.x));
+        Print(", ");
+        PrintNumber(Thousandths(actual.y));
+        Print(", ");
+        PrintNumber(Thousandths(actual.z));
+        Print(")/1000\n");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The checks
 // ---------------------------------------------------------------------------
 
 constexpr uint8_t kJumpOpcode = 0xE9;
 constexpr float kRadiansPerDegree = 0.017453292f;
+constexpr int kLuaFunctionCount = 9;
 
 void TestStartUp() {
     Section("start-up");
@@ -650,10 +852,11 @@ void TestUiLoad() {
     CheckEqual(g_uiLoads, 1, "the client's own registration still runs");
     CheckEqual(static_cast<int>(result), kRegistrationResult, "and still returns what it returned");
     CheckEqual(popped, 0, "with the stack as it left it before");
-    CheckEqual(g_registeredCount, 5, "the library registers five Lua functions");
+    CheckEqual(g_registeredCount, kLuaFunctionCount, "the library registers its Lua functions");
 
-    const char* const names[] = {"ARPG_ClientVersion", "ARPG_HoldStart", "ARPG_HoldStop", "ARPG_SetHoldInterval",
-                                 "ARPG_SetCamera"};
+    const char* const names[] = {"ARPG_ClientVersion", "ARPG_HoldStart",       "ARPG_HoldStop",
+                                 "ARPG_SetHoldInterval", "ARPG_SetGroundClicks", "ARPG_MoveTo",
+                                 "ARPG_PlayerPosition", "ARPG_SetCamera",       "ARPG_CameraInfo"};
     const uint32_t low = Fixed<uint32_t>(game::kLuaFunctionRangeMin);
     const uint32_t high = Fixed<uint32_t>(game::kLuaFunctionRangeMax);
     bool allCallable = true;
@@ -671,8 +874,7 @@ void TestUiLoad() {
 
 void TestVersion() {
     Section("ARPG_ClientVersion");
-    LuaClear();
-    CheckEqual(CallLua("ARPG_ClientVersion"), 2, "returns two values");
+    CheckEqual(CallLuaWith("ARPG_ClientVersion", 0), 2, "returns two values");
     CheckEqual(g_lua.pushes, 2, "pushed as two values");
     const bool hasVersion = g_lua.pushedString != nullptr && g_lua.pushedString[0] != '\0';
     Check(hasVersion, "a version string");
@@ -681,7 +883,24 @@ void TestVersion() {
         Print(g_lua.pushedString);
         Print("\n");
     }
-    CheckEqual(static_cast<int>(g_lua.pushedNumber), 15, "and the feature bits: all four parts working");
+    CheckEqual(static_cast<int>(g_lua.pushedNumbers[0]), 15, "and the feature bits: all four parts working");
+}
+
+void TestPlayerPosition() {
+    Section("ARPG_PlayerPosition");
+    CheckEqual(CallLuaWith("ARPG_PlayerPosition", 0), 3, "returns three values");
+    CheckEqual(static_cast<int>(g_lookupTypeMask), static_cast<int>(game::kTypeMaskPlayer),
+               "after asking the client for a player object");
+    const game::Vec3 reported = {static_cast<float>(g_lua.pushedNumbers[0]), static_cast<float>(g_lua.pushedNumbers[1]),
+                                 static_cast<float>(g_lua.pushedNumbers[2])};
+    CheckPosition(reported, g_playerPosition, "the character's position");
+
+    g_playerGuid = 0;
+    CheckEqual(CallLuaWith("ARPG_PlayerPosition", 0), 0, "nothing when there is no character");
+    g_playerGuid = kMockPlayerGuid;
+    Fixed<uint8_t>(game::kInWorldFlag) = 0;
+    CheckEqual(CallLuaWith("ARPG_PlayerPosition", 0), 0, "nothing outside the world");
+    Fixed<uint8_t>(game::kInWorldFlag) = 1;
 }
 
 void TestCamera() {
@@ -711,7 +930,7 @@ void TestCamera() {
     CheckNear(distance.distance, kObstacleDistance, "its (colliding) distance comes back untouched");
     CheckNear(distance.height, kMockHeight, "its height comes back");
     CheckNear(distance.fraction, 1.0f, "its last result comes back");
-    CheckEqual(static_cast<int>(distance.returned), static_cast<int>(kCollisionResult), "its return value comes back");
+    CheckEqual(static_cast<int>(distance.returned), static_cast<int>(kCollisionResult), "its return value comes back whole");
     CheckEqual(distance.popped, 24, "six arguments leave the stack (__thiscall)");
 
     Section("camera, locked: ARPG_SetCamera(0, 55, 30)");
@@ -730,28 +949,40 @@ void TestCamera() {
     CheckNear(g_matrix.roll, kMockRoll, "and the client's roll");
 
     distance = Collision(g_camera);
-    CheckNear(g_collision.zoom, 30.0f, "the distance routine is shown the locked distance");
+    Check((g_collision.flags & game::kCameraFlagInitialized) != 0,
+          "the lock holds on a camera in its normal, set-up state");
+    CheckNear(g_collision.zoom, 30.0f, "the distance routine sees the locked distance as the zoom");
     CheckNear(g_collision.zoomBlend, 30.0f, "in both zoom fields");
-    Check((g_collision.flags & game::kCameraFlagNoCollision) != 0, "and told not to collide");
+    Check((g_collision.flags & game::kCameraFlagFirstPerson) != 0, "and is told not to test for collisions");
     Check((g_collision.flags & kCameraFlagUnrelated) != 0, "with the camera's other flags left alone");
     CheckNear(distance.distance, 30.0f, "the camera sits at the locked distance, through the obstacle");
-    CheckEqual(static_cast<int>(distance.returned), static_cast<int>(kCollisionResult), "the return value comes back");
+    CheckEqual(static_cast<int>(distance.returned), static_cast<int>(kCollisionResult & ~game::kCameraFlagFirstPerson),
+               "the return value comes back without the first-person bit");
     CheckEqual(distance.popped, 24, "the stack is as the client expects");
-    CheckNear(game::At<float>(g_camera, game::kCameraZoom), kClientZoom, "afterwards the client's zoom is back");
-    CheckNear(game::At<float>(g_camera, game::kCameraZoomBlend), kClientZoomBlend, "and its zoom blend");
-    CheckEqual(static_cast<int>(game::At<uint32_t>(g_camera, game::kCameraFlags)), static_cast<int>(kCameraFlagUnrelated),
-               "and its flags");
+    CheckEqual(static_cast<int>(CameraFlags(g_camera)), static_cast<int>(kClientFlags),
+               "afterwards the camera's flags are what they were");
+    CheckNear(game::At<float>(g_camera, game::kCameraZoom), 30.0f,
+              "and the camera's own zoom stays at the locked distance, for the rest of the client to see");
+
+    game::At<uint32_t>(g_camera, game::kCameraFlags) |= game::kCameraFlagFirstPerson;
+    distance = Collision(g_camera);
+    CheckNear(distance.distance, 30.0f, "a camera that was in first person is locked all the same");
+    CheckEqual(static_cast<int>(CameraFlags(g_camera)), static_cast<int>(kClientFlags), "and leaves first person");
 
     Section("camera, locked with collision: ARPG_SetCamera(90, 55, 30, true)");
     SetCameraColliding(90.0, 55.0, 30.0);
     angles = Orientation(g_camera, &g_followed);
     CheckNear(angles.yaw, 90.0f * kRadiansPerDegree, "yaw is given in degrees");
+    game::At<uint32_t>(g_camera, game::kCameraFlags) |= game::kCameraFlagFirstPerson;
     distance = Collision(g_camera);
-    Check((g_collision.flags & game::kCameraFlagNoCollision) == 0, "the distance routine may collide");
+    Check((g_collision.flags & game::kCameraFlagFirstPerson) == 0, "the distance routine tests for collisions");
     CheckNear(g_collision.zoom, 30.0f, "starting from the locked distance");
     CheckNear(distance.distance, kObstacleDistance, "so the camera stops at the obstacle");
+    CheckEqual(static_cast<int>(distance.returned), static_cast<int>(kCollisionResult),
+               "and what the routine returns reaches the client whole");
 
     Section("camera, limits: ARPG_SetCamera(0, 120, 500)");
+    ResetCamera(g_camera);
     SetCamera(0.0, 120.0, 500.0);
     angles = Orientation(g_camera, &g_followed);
     CheckNear(angles.pitch, 89.0f * kRadiansPerDegree, "pitch stops short of straight down");
@@ -760,26 +991,26 @@ void TestCamera() {
 
     Section("camera, locked, but not ours to move");
     SetCamera(0.0, 55.0, 30.0);
-    game::At<uint32_t>(g_camera, game::kCameraFlags) |= game::kCameraFlagModelDriven;
-    angles = Orientation(g_camera, &g_followed);
-    CheckNear(angles.yaw, kMockYaw, "a camera driven by a model animation keeps its angles");
-    distance = Collision(g_camera);
-    CheckNear(distance.distance, kObstacleDistance, "and its distance");
-    ResetCamera(g_camera);
-
+    Collision(g_camera);
     angles = Orientation(g_otherCamera, &g_followed);
     CheckNear(angles.yaw, kMockYaw, "a camera that is not the active one keeps its angles");
     distance = Collision(g_otherCamera);
     CheckNear(distance.distance, kObstacleDistance, "and its distance");
-
+    CheckNear(game::At<float>(g_otherCamera, game::kCameraZoom), kClientZoom, "and its zoom");
     angles = Orientation(g_camera, nullptr);
     CheckNear(angles.yaw, kMockYaw, "a camera that follows nothing keeps its angles");
 
-    game::At<uint32_t>(g_camera, game::kCameraFlags) |= game::kCameraFlagNoCollision;
-    Collision(g_camera);
-    Check((game::At<uint32_t>(g_camera, game::kCameraFlags) & game::kCameraFlagNoCollision) != 0,
-          "a no-collision flag the client set itself survives");
-    ResetCamera(g_camera);
+    Section("ARPG_CameraInfo");
+    CheckEqual(CallLuaWith("ARPG_CameraInfo", 0), 5, "returns five values");
+    CheckEqual(static_cast<int>(g_lua.pushedNumbers[0]), 1, "a lock is asked for");
+    const int angleCalls = static_cast<int>(g_lua.pushedNumbers[1]);
+    const int angleLocked = static_cast<int>(g_lua.pushedNumbers[2]);
+    const int distanceCalls = static_cast<int>(g_lua.pushedNumbers[3]);
+    const int distanceLocked = static_cast<int>(g_lua.pushedNumbers[4]);
+    CheckEqual(angleCalls, g_orientation.count, "it has seen every run of the angle routine");
+    CheckEqual(distanceCalls, g_collision.count, "and of the distance routine");
+    Check(angleLocked > 0 && angleLocked < angleCalls, "and counted the runs in which it replaced the angles");
+    Check(distanceLocked > 0 && distanceLocked < distanceCalls, "and the distance");
 
     Section("camera, released: ARPG_SetCamera()");
     ReleaseCamera();
@@ -789,15 +1020,79 @@ void TestCamera() {
     CheckNear(angles.pitch, kMockPitch, "and its pitch");
     CheckEqual(g_matrix.count, 0, "the matrix is not rebuilt");
     distance = Collision(g_camera);
-    CheckNear(g_collision.zoom, kClientZoom, "the distance routine sees the client's zoom again");
+    CheckNear(g_collision.zoom, kClientZoom, "the camera has the zoom it had before the lock");
     CheckNear(distance.distance, kObstacleDistance, "and collides again");
+    CheckEqual(CallLuaWith("ARPG_CameraInfo", 0), 5, "ARPG_CameraInfo still answers");
+    CheckEqual(static_cast<int>(g_lua.pushedNumbers[0]), 0, "no lock is asked for any more");
+}
+
+void TestCameraUpdates() {
+    Section("whole camera updates, as the client runs them");
+    g_collisionReturn = 0;  // the real routine returns no flag bits unless a collision pushes the camera all the way in
+    ReleaseCamera();
+    ResetCamera(g_camera);
+    game::At<uint32_t>(g_camera, game::kCameraFlags) = kCameraFlagUnrelated;  // not set up yet: the first update does it
+    ClientCameraUpdate(g_camera, &g_followed);
+    const game::Vec3 clientSpot = {g_playerPosition.x - Cosine(kMockYaw) * Cosine(kMockPitch) * kObstacleDistance,
+                                   g_playerPosition.y - Sine(kMockYaw) * Cosine(kMockPitch) * kObstacleDistance,
+                                   g_playerPosition.z + kMockHeight + Sine(kMockPitch) * kObstacleDistance};
+    CheckPosition(game::At<game::Vec3>(g_camera, game::kCameraPosition), clientSpot,
+                  "not locked: the camera is where the client puts it, at the obstacle");
+
+    ResetCamera(g_camera);
+    SetCamera(0.0, 55.0, 30.0);
+    for (int i = 0; i < 3; ++i) {
+        ClientCameraUpdate(g_camera, &g_followed);
+    }
+    CheckPosition(game::At<game::Vec3>(g_camera, game::kCameraPosition), CameraSpot(0.0f, 55.0f, 30.0f),
+                  "locked: after three updates the camera is 30 yards out, south of and above the character");
+    CheckEqual(static_cast<int>(CameraFlags(g_camera)), static_cast<int>(kClientFlags),
+               "its flags are those of a normal third-person camera: no first person, no collision noted");
+    Check(!ClientSeesFirstPerson(g_camera), "and the client does not take the view for first person");
+
+    SetCamera(90.0, 20.0, 60.0);
+    ClientCameraUpdate(g_camera, &g_followed);
+    CheckPosition(game::At<game::Vec3>(g_camera, game::kCameraPosition), CameraSpot(90.0f, 20.0f, 60.0f),
+                  "new settings take hold on the next update: 60 yards out, east of the character, lower");
+
+    ReleaseCamera();
+    ClientCameraUpdate(g_camera, &g_followed);
+    CheckNear(g_collision.zoom, kClientZoom, "released: the next update starts from the zoom the player had");
+
+    // A player who had zoomed all the way in before the lock.
+    game::At<float>(g_camera, game::kCameraZoom) = 0.0f;
+    game::At<float>(g_camera, game::kCameraZoomBlend) = 0.0f;
+    game::At<uint32_t>(g_camera, game::kCameraFlags) = kClientFlags | game::kCameraFlagFirstPerson;
+    Check(ClientSeesFirstPerson(g_camera), "a camera zoomed all the way in is in first person");
+    SetCamera(0.0, 55.0, 30.0);
+    ClientCameraUpdate(g_camera, &g_followed);
+    CheckPosition(game::At<game::Vec3>(g_camera, game::kCameraPosition), CameraSpot(0.0f, 55.0f, 30.0f),
+                  "locked from first person: the camera still goes 30 yards out");
+    Check(!ClientSeesFirstPerson(g_camera), "and the client shows the character again");
+    ReleaseCamera();
+    ClientCameraUpdate(g_camera, &g_followed);
+    Check(ClientSeesFirstPerson(g_camera), "released: the player is back in first person");
+
+    ResetCamera(g_camera);
+    SetCameraColliding(0.0, 55.0, 30.0);
+    for (int i = 0; i < 3; ++i) {
+        ClientCameraUpdate(g_camera, &g_followed);
+    }
+    CheckPosition(game::At<game::Vec3>(g_camera, game::kCameraPosition), CameraSpot(0.0f, 55.0f, kObstacleDistance),
+                  "locked with collision: the camera stays at the obstacle, update after update");
+    CheckNear(g_collision.zoom, 30.0f, "each update starting again from the locked distance");
+
+    ReleaseCamera();
+    ResetCamera(g_camera);
+    g_collisionReturn = kCollisionResult;
 }
 
 void TestHoldMove() {
     Section("frames with nothing held");
     g_frame = {};
     g_click = {};
-    g_click.nextKind = game::kHitTerrain;
+    g_terrain = {};
+    PointCursorAt(game::kHitGround, kStepUnderCursor);
     FrameResult frame = Frame();
     CheckEqual(g_frame.count, 1, "the client's frame handler runs");
     Check(g_frame.arguments[0] == kFrameArguments[0] && g_frame.arguments[1] == kFrameArguments[1] &&
@@ -819,6 +1114,7 @@ void TestHoldMove() {
     CheckEqual(g_click.performs, 1, "and acts once");
     CheckEqual(g_click.lastButton, game::kClickRight, "as a right click: click-to-move");
     Check(g_click.performFrame == g_worldFrame, "on the client's world frame");
+    CheckPosition(g_click.performPosition, kStepUnderCursor, "at the spot the cursor is on");
     Frame();
     CheckEqual(g_click.captures, 1, "the frame after that does nothing: the repeat interval has not passed");
 
@@ -827,43 +1123,48 @@ void TestHoldMove() {
     WaitForRepeat();
     Frame();
     CheckEqual(g_click.performs, 2, "once the interval has passed, the move is issued again");
-    g_click.nextKind = game::kHitWorldObject;
+    PointCursorAt(game::kHitObjectGeometry, kStepUnderCursor);
     WaitForRepeat();
     Frame();
-    CheckEqual(g_click.performs, 3, "a building under the cursor counts as ground");
-    g_click.nextKind = game::kHitObject;
+    CheckEqual(g_click.performs, 3, "the deck of a ship under the cursor counts as ground");
+    PointCursorAt(game::kHitObject, kStepUnderCursor);
     WaitForRepeat();
     Frame();
     CheckEqual(g_click.captures, 4, "over a unit the cursor is still followed");
     CheckEqual(g_click.performs, 3, "but a held button does not click the unit again and again");
-    g_click.nextKind = game::kHitNothing;
+    CheckEqual(g_terrain.count, 0, "and, without ground clicks, does not move either");
+    PointCursorAt(game::kHitNothing, kStepUnderCursor);
     WaitForRepeat();
     Frame();
     CheckEqual(g_click.performs, 3, "and nothing under the cursor means nothing to do");
 
     Section("release: ARPG_HoldStop()");
     Release();
-    g_click.nextKind = game::kHitTerrain;
+    PointCursorAt(game::kHitGround, kStepUnderCursor);
     WaitForRepeat();
     Frame();
     CheckEqual(g_click.captures, 5, "after the release nothing looks under the cursor any more");
     CheckEqual(g_click.performs, 3, "and nothing moves");
 
     Section("other presses");
-    g_click.nextKind = game::kHitObject;
+    PointCursorAt(game::kHitObject, kStepUnderCursor);
     Press();
     Frame();
     CheckEqual(g_click.performs, 4, "a press on a unit acts on it once");
     CheckEqual(g_click.lastButton, game::kClickRight, "as a right click: interact, attack, loot");
+    PointCursorAt(game::kHitGround, kStepUnderCursor);
+    WaitForRepeat();
+    Frame();
+    CheckEqual(g_click.performs, 4, "and if the cursor then slips onto the ground, the character is not called off");
     Release();
 
-    g_click.nextKind = game::kHitNothing;
+    PointCursorAt(game::kHitNothing, kStepUnderCursor);
     Press();
     Frame();
     CheckEqual(g_click.performs, 4, "a press on nothing does nothing");
     Release();
 
-    g_click.nextKind = game::kHitTerrain;
+    PointCursorAt(game::kHitGround, kStepUnderCursor);
     Press();
     Release();
     Frame();
@@ -903,23 +1204,143 @@ void TestHoldMove() {
     Release();
 }
 
+// One press with the cursor as set up; returns the position the click acted on.
+game::Vec3 ClickedPosition() {
+    Press();
+    Release();
+    Frame();
+    return g_click.performPosition;
+}
+
+void TestGroundClicks() {
+    Section("ground clicks off: a click lands where the cursor's ray lands");
+    g_click = {};
+    g_terrain = {};
+    PointCursorAt(game::kHitGround, kRoofUnderCursor);
+    CheckPosition(ClickedPosition(), kRoofUnderCursor, "on the roof");
+
+    Section("ground clicks: ARPG_SetGroundClicks(3)");
+    CallLuaWith("ARPG_SetGroundClicks", 1, 3.0);
+    PointCursorAt(game::kHitGround, kRoofUnderCursor);
+    CheckPosition(ClickedPosition(), kGroundUnderCursor,
+                  "a click on a roof goes to where the ray reaches the height of the character's feet");
+    CheckEqual(g_click.lastButton, game::kClickRight, "still as a right click");
+    PointCursorAt(game::kHitObjectGeometry, kRoofUnderCursor);
+    CheckPosition(ClickedPosition(), kGroundUnderCursor, "so does a click high up on a game object's shape");
+    PointCursorAt(game::kHitGround, kStepUnderCursor);
+    CheckPosition(ClickedPosition(), kStepUnderCursor, "a click within reach of the feet stays where it is");
+    const game::Vec3 below = {125.0f, 200.0f, -5.0f};
+    PointCursorAt(game::kHitGround, below);
+    CheckPosition(ClickedPosition(), below, "and so does a click below the character");
+
+    PointCursorAt(game::kHitGround, kRoofUnderCursor);
+    g_cursor.guidHigh = 0x1FC00000;
+    CheckPosition(ClickedPosition(), kRoofUnderCursor, "a hit on a transport is left in the transport's coordinates");
+
+    PointCursorAt(game::kHitGround, kRoofUnderCursor);
+    g_cursor.rayStart = kRayEnd;
+    g_cursor.rayEnd = kRayStart;
+    CheckPosition(ClickedPosition(), kGroundUnderCursor, "it does not matter which end of the ray comes first");
+
+    PointCursorAt(game::kHitGround, kRoofUnderCursor);
+    g_cursor.rayEnd = {120.0f, 200.0f, 20.0f};
+    CheckPosition(ClickedPosition(), kRoofUnderCursor, "a ray that never gets down to the character's height is left alone");
+
+    PointCursorAt(game::kHitGround, kRoofUnderCursor);
+    g_cursor.rayEnd = {10070.0f, 200.0f, -50.0f};
+    CheckPosition(ClickedPosition(), kRoofUnderCursor, "and so is one that comes down thousands of yards away");
+
+    PointCursorAt(game::kHitGround, kRoofUnderCursor);
+    g_playerGuid = 0;
+    CheckPosition(ClickedPosition(), kRoofUnderCursor, "and so is everything when the character cannot be found");
+    g_playerGuid = kMockPlayerGuid;
+
+    CallLuaWith("ARPG_SetGroundClicks", 1, 25.0);
+    PointCursorAt(game::kHitGround, kRoofUnderCursor);
+    CheckPosition(ClickedPosition(), kRoofUnderCursor, "ARPG_SetGroundClicks(25): the same roof now counts as within reach");
+    CallLuaWith("ARPG_SetGroundClicks", 1, 3.0);
+
+    Section("ground clicks: holding over a unit");
+    SetHoldInterval(10.0);
+    PointCursorAt(game::kHitGround, kStepUnderCursor);
+    Press();
+    Frame();
+    const int performs = g_click.performs;
+    PointCursorAt(game::kHitObject, kStepUnderCursor);
+    WaitForRepeat();
+    Frame();
+    CheckEqual(g_click.performs, performs, "the unit is not clicked");
+    CheckEqual(g_terrain.count, 1, "the character keeps walking instead");
+    CheckPosition(g_terrain.last.position, kGroundUnderCursor, "towards the ground under the cursor");
+    Check(g_terrain.last.button == game::kClickRight && g_terrain.last.transportGuidLow == 0 &&
+              g_terrain.last.transportGuidHigh == 0,
+          "as a right click on plain ground");
+    Release();
+
+    Section("ground clicks off again: ARPG_SetGroundClicks()");
+    CallLuaWith("ARPG_SetGroundClicks", 0);
+    PointCursorAt(game::kHitGround, kRoofUnderCursor);
+    CheckPosition(ClickedPosition(), kRoofUnderCursor, "the click is back on the roof");
+}
+
+void TestMoveTo() {
+    Section("ARPG_MoveTo(500, 600)");
+    g_terrain = {};
+    const int frames = g_frame.count;
+    CallLuaWith("ARPG_MoveTo", 2, 500.0, 600.0);
+    CheckEqual(g_terrain.count, 0, "the Lua call itself does nothing in the world");
+    Frame();
+    CheckEqual(g_frame.count, frames + 1, "the frame handler still runs");
+    CheckEqual(g_terrain.count, 1, "the next frame clicks the ground once");
+    const game::Vec3 expected = {500.0f, 600.0f, g_playerPosition.z};
+    CheckPosition(g_terrain.last.position, expected, "at that spot, at the character's own height");
+    Check(g_terrain.last.button == game::kClickRight && g_terrain.last.transportGuidLow == 0 &&
+              g_terrain.last.transportGuidHigh == 0,
+          "as a right click on plain ground");
+    Frame();
+    CheckEqual(g_terrain.count, 1, "and only once");
+
+    CallLuaWith("ARPG_MoveTo", 3, 1.0, 2.0, 3.0);
+    Frame();
+    const game::Vec3 exact = {1.0f, 2.0f, 3.0f};
+    CheckPosition(g_terrain.last.position, exact, "ARPG_MoveTo(1, 2, 3): a given height is used as it is");
+
+    CallLuaWith("ARPG_MoveTo", 1, 5.0);
+    Frame();
+    CheckEqual(g_terrain.count, 2, "ARPG_MoveTo(5): without both coordinates nothing happens");
+
+    CallLuaWith("ARPG_MoveTo", 2, 7.0, 8.0);
+    Fixed<uint8_t>(game::kInWorldFlag) = 0;
+    Frame();
+    Fixed<uint8_t>(game::kInWorldFlag) = 1;
+    Frame();
+    CheckEqual(g_terrain.count, 2, "a request made outside the world is dropped, not kept for later");
+}
+
 void TestUiReload() {
     Section("UI reload");
     SetCamera(0.0, 55.0, 30.0);
-    g_click.nextKind = game::kHitTerrain;
+    CallLuaWith("ARPG_SetGroundClicks", 1, 3.0);
+    CallLuaWith("ARPG_MoveTo", 2, 9.0, 9.0);
+    PointCursorAt(game::kHitGround, kRoofUnderCursor);
     Press();
     const int captures = g_click.captures;
+    const int terrainClicks = g_terrain.count;
 
     int popped = -1;
     CallClient(kRegistrationRoutine, nullptr, nullptr, 0, &popped);
     CheckEqual(g_uiLoads, 2, "the client registers its functions again");
-    CheckEqual(g_registeredCount, 10, "and so does the library");
+    CheckEqual(g_registeredCount, 2 * kLuaFunctionCount, "and so does the library");
 
     const Angles angles = Orientation(g_camera, &g_followed);
     CheckNear(angles.yaw, kMockYaw, "the camera lock is dropped until the new UI asks for it");
     WaitForRepeat();
     Frame();
     CheckEqual(g_click.captures, captures, "and so is the held button");
+    CheckEqual(g_terrain.count, terrainClicks, "and a move that was still waiting");
+    CheckPosition(ClickedPosition(), kRoofUnderCursor, "and ground clicks");
+    CheckEqual(CallLuaWith("ARPG_CameraInfo", 0), 5, "ARPG_CameraInfo answers");
+    Check(static_cast<int>(g_lua.pushedNumbers[1]) <= 1, "with its counts started afresh");
 }
 
 }  // namespace
@@ -943,8 +1364,12 @@ int MockMain() {
     TestStartUp();
     TestUiLoad();
     TestVersion();
+    TestPlayerPosition();
     TestCamera();
+    TestCameraUpdates();
     TestHoldMove();
+    TestGroundClicks();
+    TestMoveTo();
     TestUiReload();
 
     Print("\n");

@@ -52,15 +52,30 @@ makeSlider("camPitch", "Angle (higher looks more straight down)", 10, 89, "", -9
 makeSlider("camDistance", "Distance from the character", 5, 100, " yd", -150)
 makeSlider("camYaw", "Facing (0 keeps north at the top)", -180, 180, "", -210)
 
-local indoor = CreateFrame("CheckButton", "WotLKARPGOptions_Indoor", panel, "InterfaceOptionsCheckButtonTemplate")
-indoor:SetPoint("TOPLEFT", 20, -262)
-_G["WotLKARPGOptions_IndoorText"]:SetText("Indoors, let the camera collide so the character stays in view")
-indoor.setFunc = function(value)
-    if ns.db then
-        ns.db.indoorCollision = (value == "1")
-        ns:ApplyClientCamera()
+local checks = {}
+
+-- A tick box bound to one on/off value in the saved settings.
+local function makeCheck(key, label, offsetY, apply)
+    local name = "WotLKARPGOptions_" .. key
+    local check = CreateFrame("CheckButton", name, panel, "InterfaceOptionsCheckButtonTemplate")
+    check:SetPoint("TOPLEFT", 20, offsetY)
+    _G[name .. "Text"]:SetText(label)
+    check.setFunc = function(value)
+        if ns.db then
+            ns.db[key] = (value == "1")
+            apply()
+        end
     end
+    checks[key] = check
+    return check
 end
+
+makeCheck("indoorCollision", "Indoors, let the camera collide so the character stays in view", -262,
+    function() ns:ApplyClientCamera() end)
+makeCheck("groundClicks", "Clicks on roofs and treetops move to the ground under the cursor", -290,
+    function() ns:ApplyGroundClicks() end)
+makeCheck("soundAtCamera", "Hear the world from the camera, so left and right match the screen", -318,
+    function() if ns.db.enabled then ns:ApplyCVars() end end)
 
 local function refresh()
     if not ns.db then return end
@@ -69,7 +84,9 @@ local function refresh()
         slider:SetValue(ns.db[key])
         slider.ShowValue(ns.db[key]) -- SetValue is silent when the value is already there
     end
-    indoor:SetChecked(ns.db.indoorCollision)
+    for key, check in pairs(checks) do
+        check:SetChecked(ns.db[key])
+    end
     panel.refreshing = nil
 
     if ns:ClientCanLockCamera() then

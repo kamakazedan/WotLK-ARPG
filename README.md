@@ -17,14 +17,18 @@ It comes in two parts:
 | One switch for the whole mode, fully reversible | addon | done |
 | WASD off unless enabled, toggle works in combat | addon | done |
 | No scroll zoom, camera stops following the character | addon | done |
-| Hold the left mouse button to keep moving; click to interact, attack, loot | client library | built, being proven in game |
-| Camera locked facing north at a set angle and distance | client library | built, being proven in game |
-| Camera passes through objects instead of zooming in | client library | built, being proven in game |
-| Camera settings panel | addon | built, being proven in game |
-| Buildings and caves cut away above the character | client library | next |
-| Skills aim at the cursor, character turns to face the target | client library | planned |
-| Skill bar, health and resource orbs, overlay map | addon | planned |
-| Casting while moving, dodge, pathing around obstacles | server + Spell.dbc | planned |
+| Hold the left mouse button to keep moving; click to interact, attack, loot | client library | works in game |
+| Camera locked facing north at a set angle and distance | client library | fixed in 0.2.1, being proven in game |
+| Camera passes through objects instead of zooming in | client library | fixed in 0.2.1, being proven in game |
+| Clicks on roofs and treetops move to the ground under the cursor | client library | new in 0.2.1, being proven in game |
+| Sound heard from the camera, so left and right match the screen | addon | new in 0.2.1 |
+| Camera settings panel | addon | done |
+| A skill on the left mouse button (and the right, with WASD on): walk into range, then cast | addon + client library | next |
+| Bigger minimap; click it to walk there | CleanMinimap-WotLK + client library | planned |
+| World map in a window; click a place to travel there | BetterMaps-WotLK + server pathing | planned |
+| Buildings and caves cut away above the character | client library | planned |
+| Health and resource orbs | addon | planned |
+| Casting while moving, dodge | server + Spell.dbc | planned |
 
 ## Install
 
@@ -57,8 +61,10 @@ Addon only, no client changes: copy `addon/WotLK-ARPG` into `Interface/AddOns/`.
 | `/arpg angle 55` | How steeply the camera looks down, 10 to 89 degrees |
 | `/arpg distance 30` | How far the camera is from the character, 5 to 100 yards |
 | `/arpg facing 0` | Which way the camera faces; 0 keeps north at the top |
+| `/arpg ground` | Roof and treetop clicks go to the ground under the cursor, on or off; `/arpg ground 3` sets from how many yards up |
+| `/arpg sound` | Hear the world from the camera or from the character |
 | `/arpg camedit` | Free the camera, mouse and scroll wheel for a look around |
-| `/arpg status` | Show what is on, and whether the client library is working |
+| `/arpg status` | Show what is on, and whether the camera lock is really in effect |
 
 Keys for the mode and for the WASD toggle are under **Key Bindings > WotLK-ARPG**.
 Bind the WASD toggle there: it is the one that works in combat.
@@ -69,20 +75,33 @@ While the mode is on:
   following the cursor. Press on a creature, player, object or corpse to walk
   up and interact, attack or loot. If a spell is waiting for a target, the
   press gives it one.
+- **Roofs and treetops**: from above, the cursor is often on a roof when you
+  mean the street or the floor behind it. A move click that lands more than
+  3 yards above your character's feet goes instead to the spot where the
+  cursor's line of sight reaches your character's own height. On a steep
+  hillside that makes a far uphill click land a little further up the screen
+  than the cursor; raise the height with `/arpg ground 6`, or switch it off,
+  if that gets in the way.
+- **Sound** is heard from where the camera is, facing the way it faces, so a
+  noise on the right of the screen comes from the right speaker. It is also
+  as far away as the camera is; `/arpg sound` switches back.
 - **Camera**: stays where the settings put it. Indoors it is allowed to collide
   with walls so the character stays in view; untick that in the options to see
   what it does without. This stopgap goes when buildings are cut away.
 - **Scroll wheel and right mouse button**: do nothing, for now.
 
-Turning the mode off puts everything back. The addon never changes your saved
-key bindings, and it restores every setting it touched.
+The mode and its settings are remembered per character: if it was on when you
+logged out, it is on, camera and all, when you log back in. Turning it off
+puts everything back. The addon never changes your saved key bindings, and it
+restores every setting it touched.
 
 Without the client library the addon still works: one click per move,
 `/arpg camedit` and `/arpg savecam` to set the camera up by hand.
 
 ## If something is off
 
-- `/arpg status` says whether the library loaded and which parts are working.
+- `/arpg status` says whether the library loaded, which parts are working, and
+  in how many of the client's camera updates the lock was actually applied.
 - `WotLK-ARPG.log`, next to `Wow.exe`, is written at every start. It lists each
   place the library patched, or why it left one alone.
 - The library refuses to touch a client it does not recognise: every patch
