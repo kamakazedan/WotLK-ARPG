@@ -285,7 +285,7 @@ struct MockLua {
     int booleans[4];
     int pushes;
     const char* pushedString;
-    double pushedNumbers[12];
+    double pushedNumbers[16];
     int pushedNumberCount;
 };
 MockLua g_lua;
@@ -310,12 +310,61 @@ bool g_deviceRescalesDepth = true;
 bool g_outdoors = true;             // what the client's own test says about the character
 void* g_outdoorsAskedOf = nullptr;
 int g_locateCalls = 0;
-void* g_cameraStandsIn = nullptr;   // the building the client's routine finds the camera in, if any
+void* g_cameraStandsIn = nullptr;   // the building the client's routine finds under the camera, if any
+
+// What the client's routine finds under the character: the room the
+// character is in. Null for the open sky, and for a building this routine
+// does not find although the client's own indoors test knows of it.
+struct Room {
+    void* building;
+    uint32_t group;
+};
+Room g_characterRoom = {nullptr, 0};
+game::Vec3 g_locatedFrom = {};     // where the last lookup was made from
+uint32_t g_cameraGroup = 0;        // the group it found
+bool g_roomShowsSky = false;       // a room the client shows the whole sky from, whatever the doorways
+
+// The walk from the camera's room through the doorways.
+struct WalkCalls {
+    int count;
+    void* building;
+    void* groups;
+    game::Vec3 camera;  // kSceneCameraPosition at the time: the doorways are judged from there
+};
+WalkCalls g_walk;
+constexpr int kMaxReach = 4;
+uint32_t g_walkReaches[kMaxReach];  // rooms the walk reaches beyond the camera's own
+int g_walkReachCount = 0;
+bool g_doorToOutdoors = false;      // the walk comes across a doorway to the outdoor world
+bool g_walkLeavesViewNarrowed = false;  // the scene's view is not back at the whole screen after the walk
+constexpr game::OutdoorWindow kDoorway = {0.4f, 0.3f, 0.6f, 0.7f, 5.0f};
+constexpr game::OutdoorWindow kWholeScreen = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f};
+
+struct ClearCalls {
+    int count;
+    uint32_t what;
+    uint32_t colour;
+};
+ClearCalls g_clear;
+uint32_t g_clearArgument = 0;  // the colour the client is about to clear the screen to
+constexpr uint32_t kSkyColour = 0xFF6688CC;
+constexpr uint32_t kFogColour = 0xFFF0F0F0;  // whitish, like the bank's
+
+struct FogCalls {
+    int count;
+    float start;
+    float end;
+    float density;
+    uint32_t colour;
+};
+FogCalls g_fog;
 
 struct Visit {
     void* building;
     uint32_t index;
     uint32_t interiorPath;
+    int32_t level;  // the scene's stack of views at the time: 0 is the whole screen
+    bool first;     // this visit put the group on the frame's list
 };
 constexpr int kMaxVisits = 32;
 Visit g_visits[kMaxVisits];
@@ -342,20 +391,57 @@ struct Slab {
     float z0;
     float z1;
     float north;
+    float south = -1e9f;  // and from here on northwards
 };
 constexpr float kEverywhere = 1e9f;
 constexpr int kSlabs = 3;
 Slab g_slabs[kSlabs] = {{false, 0.0f, 0.0f, kEverywhere},
                         {false, 0.0f, 0.0f, kEverywhere},
                         {true, 9.0f, 10.0f, kEverywhere}};  // the floor: its top is where the feet are
+
+// Upright walls running east to west, for the cursor's ray to go through.
+struct Wall {
+    bool present;
+    float x;
+    float z0;
+    float z1;
+};
+constexpr int kWalls = 8;
+Wall g_walls[kWalls] = {};
+
 struct IntersectCalls {
     int count;
     int upward;
     int downward;
+    int slanted;  // lines that are not straight up or down
+    int click;    // lines tested against everything a click can land on
     uint32_t flags;
     uint32_t last;
 };
 IntersectCalls g_intersect;
+
+// Rooms as the client's "which group is on this line" sees them: a floor
+// and a ceiling, each a surface of the room's group, between two walls
+// running east to west; and over some, a roof that belongs to the outdoor
+// shell.
+struct LookupRoom {
+    bool present;
+    float south;
+    float north;
+    float floor;
+    float ceiling;
+    void* building;
+    uint32_t group;
+    bool roofOver;
+};
+constexpr int kLookupRooms = 4;
+LookupRoom g_lookupRooms[kLookupRooms] = {};
+struct LookupCalls {
+    int count;
+    int slanted;
+    int fractionNotOne;
+};
+LookupCalls g_lookups;
 bool g_intersectLies = false;             // report a hit point that is not where "how far along" says
 bool g_intersectCountsFromFarEnd = false;  // report the last thing on the line, not the first
 
@@ -526,7 +612,7 @@ int __cdecl MockToBoolean(game::lua_State*, int index) {
 
 void __cdecl MockPushNumber(game::lua_State*, double value) {
     ++g_lua.pushes;
-    if (g_lua.pushedNumberCount < 12) {
+    if (g_lua.pushedNumberCount < 16) {
         g_lua.pushedNumbers[g_lua.pushedNumberCount++] = value;
     }
 }
@@ -564,15 +650,28 @@ bool __fastcall MockUnitIsOutdoors(void* unit) {
     return g_outdoors;
 }
 
-// Like the real routine: clears what it found last time, then looks.
+// Like the real routine: clears what it found last time, reads the camera's
+// position once, and looks straight down from there. Started within the
+// character it finds the character's room; started anywhere else, whatever
+// the test has put under the camera.
 void __cdecl MockLocateCamera() {
     ++g_locateCalls;
-    Fixed<void*>(game::kSceneCameraBuilding) = g_cameraStandsIn;
+    const game::Vec3 from = Fixed<game::Vec3>(game::kSceneCameraPosition);
+    g_locatedFrom = from;
+    const float aside = (from.x - g_playerPosition.x) * (from.x - g_playerPosition.x) +
+                        (from.y - g_playerPosition.y) * (from.y - g_playerPosition.y);
+    const bool atCharacter = aside < 0.0001f && from.z > g_playerPosition.z && from.z < g_playerPosition.z + 3.0f;
+    void* building = atCharacter ? g_characterRoom.building : g_cameraStandsIn;
+    g_cameraGroup = atCharacter ? g_characterRoom.group : 0;
+    Fixed<void*>(game::kSceneCameraBuilding) = building;
     Fixed<void*>(game::kSceneCameraBuildingSecond) = nullptr;
-    Fixed<uint32_t>(game::kSceneCameraGroupCount) = g_cameraStandsIn != nullptr ? 1 : 0;
+    Fixed<uint32_t>(game::kSceneCameraGroupCount) = building != nullptr ? 1 : 0;
     Fixed<uint32_t>(game::kSceneCameraGroupCountSecond) = 0;
-    Fixed<char>(game::kSceneCameraBuildingName) = g_cameraStandsIn != nullptr ? 'w' : '\0';
-    Fixed<char>(game::kSceneCameraGroupName) = g_cameraStandsIn != nullptr ? 'g' : '\0';
+    Fixed<char>(game::kSceneCameraBuildingName) = building != nullptr ? 'w' : '\0';
+    Fixed<char>(game::kSceneCameraGroupName) = building != nullptr ? 'g' : '\0';
+    if (building != nullptr && g_roomShowsSky) {
+        Fixed<game::OutdoorWindow>(game::kSceneSkyWindow) = kWholeScreen;
+    }
 }
 
 // Like the real routine, this looks the placed group up by index and uses
@@ -593,10 +692,102 @@ void __cdecl MockVisit(uint32_t index, void* buildingPointer) {
         ++g_visitsOfUnreadyGroups;
         return;
     }
+    // The first visit of a frame puts the group on the list of groups to
+    // draw; every visit adds the view it was made under as a window onto it.
+    uint32_t& queued = game::At<uint32_t>(placed, game::kPlacedGroupQueued);
+    const bool first = queued == 0;
+    queued = 0x00C0FFE0;
     if (g_visitCount < kMaxVisits) {
-        g_visits[g_visitCount] = {building, index, Fixed<uint32_t>(game::kSceneInteriorPath)};
+        g_visits[g_visitCount] = {building, index, Fixed<uint32_t>(game::kSceneInteriorPath),
+                                  Fixed<int32_t>(game::kSceneFrustumLevel), first};
     }
     ++g_visitCount;
+}
+
+// The client's walk: the camera's own room, and from there through the
+// doorways. Each room beyond a doorway is visited under a view narrowed to
+// that doorway. A doorway to the outdoor world opens a window for it.
+void __fastcall MockWalkRooms(uint8_t* building, void*, void* groups) {
+    ++g_walk.count;
+    g_walk.building = building;
+    g_walk.groups = groups;
+    g_walk.camera = Fixed<game::Vec3>(game::kSceneCameraPosition);
+    const uint32_t interiorPath = Fixed<uint32_t>(game::kSceneInteriorPath);
+    Fixed<uint32_t>(game::kSceneInteriorPath) = 1;
+    MockVisit(g_cameraGroup, building);
+    Fixed<int32_t>(game::kSceneFrustumLevel) = 1;
+    for (int i = 0; i < g_walkReachCount; ++i) {
+        MockVisit(g_walkReaches[i], building);
+    }
+    Fixed<int32_t>(game::kSceneFrustumLevel) = g_walkLeavesViewNarrowed ? 1 : 0;
+    Fixed<uint32_t>(game::kSceneInteriorPath) = interiorPath;
+    if (g_doorToOutdoors) {
+        Fixed<game::OutdoorWindow>(game::kSceneSkyWindow) = kDoorway;
+        Fixed<game::OutdoorWindow>(game::kSceneOutdoorWindow) = kDoorway;
+    }
+}
+
+void __cdecl MockSceneClear(uint32_t what, uint32_t colour) {
+    ++g_clear.count;
+    g_clear.what = what;
+    g_clear.colour = colour;
+}
+
+void __cdecl MockSetFog(float start, float end, float density, const uint32_t* colour) {
+    ++g_fog.count;
+    g_fog.start = start;
+    g_fog.end = end;
+    g_fog.density = density;
+    g_fog.colour = *colour;
+}
+
+// The client's "which building group does this line meet first". Outdoor
+// surfaces count as nothing found.
+bool __cdecl MockFindGroupOnLine(const game::Vec3* from, const game::Vec3* to, float fraction, void** buildings,
+                                 uint32_t* groups) {
+    ++g_lookups.count;
+    if (from->x != to->x || from->y != to->y) {
+        ++g_lookups.slanted;
+    }
+    if (fraction != 1.0f) {
+        ++g_lookups.fractionNotOne;
+    }
+    buildings[0] = nullptr;
+    buildings[1] = nullptr;
+    for (int i = 0; i < 4; ++i) {
+        groups[i] = 0xFFFF;
+    }
+    bool any = false;
+    float best = 0.0f;
+    void* bestBuilding = nullptr;
+    uint32_t bestGroup = 0xFFFF;
+    for (const LookupRoom& room : g_lookupRooms) {
+        if (!room.present || from->x < room.south || from->x > room.north) {
+            continue;
+        }
+        const float heights[3] = {room.floor, room.ceiling, room.ceiling + 1.0f};
+        for (int i = 0; i < (room.roofOver ? 3 : 2); ++i) {
+            const float height = heights[i];
+            const bool through = (from->z < height && to->z > height) || (from->z > height && to->z < height);
+            if (!through) {
+                continue;
+            }
+            const float along = (height - from->z) / (to->z - from->z);
+            if (any && along >= best) {
+                continue;
+            }
+            any = true;
+            best = along;
+            bestBuilding = i == 2 ? nullptr : room.building;
+            bestGroup = room.group;
+        }
+    }
+    if (bestBuilding == nullptr) {
+        return false;
+    }
+    buildings[0] = bestBuilding;
+    groups[0] = bestGroup;
+    return true;
 }
 
 int __cdecl MockBoxOutsideView(const game::Box* box) {
@@ -626,6 +817,12 @@ bool __cdecl MockIntersect(const game::Vec3* from, const game::Vec3* to, game::V
                            uint32_t flags, uint32_t last) {
     ++g_intersect.count;
     ++(to->z > from->z ? g_intersect.upward : g_intersect.downward);
+    if (from->x != to->x || from->y != to->y) {
+        ++g_intersect.slanted;
+    }
+    if (flags == game::kIntersectClick) {
+        ++g_intersect.click;
+    }
     g_intersect.flags = flags;
     g_intersect.last = last;
     if (*fraction != 1.0f) {
@@ -633,7 +830,12 @@ bool __cdecl MockIntersect(const game::Vec3* from, const game::Vec3* to, game::V
     }
     bool any = false;
     float best = 0.0f;
-    float bestFace = 0.0f;
+    const auto consider = [&](float along) {
+        if (!any || (g_intersectCountsFromFarEnd ? along > best : along < best)) {
+            any = true;
+            best = along;
+        }
+    };
     for (const Slab& slab : g_slabs) {
         if (!slab.present) {
             continue;
@@ -645,15 +847,21 @@ bool __cdecl MockIntersect(const game::Vec3* from, const game::Vec3* to, game::V
                 continue;
             }
             const float along = (face - from->z) / (to->z - from->z);
-            if (from->x + (to->x - from->x) * along > slab.north) {
-                continue;
+            const float x = from->x + (to->x - from->x) * along;
+            if (x <= slab.north && x >= slab.south) {
+                consider(along);
             }
-            if (any && (g_intersectCountsFromFarEnd ? along <= best : along >= best)) {
-                continue;
-            }
-            any = true;
-            best = along;
-            bestFace = face;
+        }
+    }
+    for (const Wall& wall : g_walls) {
+        const bool through = (from->x < wall.x && to->x > wall.x) || (from->x > wall.x && to->x < wall.x);
+        if (!wall.present || !through) {
+            continue;
+        }
+        const float along = (wall.x - from->x) / (to->x - from->x);
+        const float z = from->z + (to->z - from->z) * along;
+        if (z >= wall.z0 && z <= wall.z1) {
+            consider(along);
         }
     }
     if (!any) {
@@ -661,7 +869,7 @@ bool __cdecl MockIntersect(const game::Vec3* from, const game::Vec3* to, game::V
     }
     hit->x = from->x + (to->x - from->x) * best;
     hit->y = from->y + (to->y - from->y) * best;
-    hit->z = g_intersectLies ? bestFace + 5.0f : bestFace;
+    hit->z = from->z + (to->z - from->z) * best + (g_intersectLies ? 5.0f : 0.0f);
     *fraction = best;
     return true;
 }
@@ -722,6 +930,16 @@ constexpr uintptr_t kLocateCameraRoutine = CallTarget(game::kLocateCameraCall, g
 constexpr uintptr_t kFinishVisitsRoutine = CallTarget(game::kFinishVisitsCall, game::kFinishVisitsCallBytes);
 constexpr uintptr_t kBeforeDrawingRoutine = CallTarget(game::kBeforeDrawingCall, game::kBeforeDrawingCallBytes);
 constexpr uintptr_t kCursorRayRoutine = CallTarget(game::kCursorRayCall, game::kCursorRayCallBytes);
+constexpr uintptr_t kWalkRoomsRoutine = CallTarget(game::kWalkRoomsCall, game::kWalkRoomsCallBytes);
+constexpr uintptr_t kSceneClearRoutine = CallTarget(game::kSceneClearCall, game::kSceneClearCallBytes);
+
+// The client's own instructions in front of the walk through the rooms:
+// mov ecx,[kSceneCameraBuilding]; push the list of the camera's groups.
+constexpr uint8_t kWalkRoomsLeadIn[] = {0x8B, 0x0D, 0xA4, 0x87, 0xCD, 0x00, 0x68, 0xD4, 0xB0, 0xCD, 0x00};
+constexpr uintptr_t kWalkRoomsEntry = game::kWalkRoomsCall - sizeof(kWalkRoomsLeadIn);
+constexpr uintptr_t kCameraGroupList = 0x00CDB0D4;
+// And in front of the screen clear: (mov eax,[colour];) push eax; push 3.
+constexpr uintptr_t kSceneClearEntry = game::kSceneClearCall - 8;
 
 // The mock's cut-down cursor hit test: thirty bytes that put the arguments
 // in place, so that its call lands exactly on the client's address for it.
@@ -752,6 +970,10 @@ bool AddressesFit() {
         game::kFinishVisitsCall,     game::kBeforeDrawingCall,     kCursorHitTest,
         kLocateCameraRoutine,        kFinishVisitsRoutine,         kBeforeDrawingRoutine,
         kCursorRayRoutine,
+        game::kWalkRoomsCall,        game::kSceneClearCall,        kWalkRoomsEntry,
+        kSceneClearEntry,            kWalkRoomsRoutine,            kSceneClearRoutine,
+        game::kSetFog,               game::kFindGroupOnLine,       game::kWorldSwitches,
+        game::kSceneSkyWindow,       game::kSceneOutdoorWindow,    kCameraGroupList,
     };
     for (uintptr_t address : addresses) {
         if (!Fits(address)) {
@@ -844,6 +1066,39 @@ void BuildClient() {
     Word(at, Address(&g_rayResult));
     Fixed<uint8_t>(at++) = 0xC3;
     JumpAt(kCursorRayRoutine, CodeAddress(MockCursorRay));
+
+    // The walk through the rooms and the screen clear: the client's own
+    // instructions around each call, so that the arguments arrive the way
+    // they do in the client.
+    at = kWalkRoomsEntry;
+    Bytes(at, kWalkRoomsLeadIn, sizeof(kWalkRoomsLeadIn));
+    Bytes(at, game::kWalkRoomsCallBytes, sizeof(game::kWalkRoomsCallBytes));  // lands on kWalkRoomsCall
+    Fixed<uint8_t>(at++) = 0xC3;
+    JumpAt(kWalkRoomsRoutine, CodeAddress(MockWalkRooms));
+
+    at = kSceneClearEntry;
+    Fixed<uint8_t>(at++) = 0xA1;  // mov eax, [address]
+    Word(at, Address(&g_clearArgument));
+    Fixed<uint8_t>(at++) = 0x50;  // push eax
+    Fixed<uint8_t>(at++) = 0x6A;  // push 3
+    Fixed<uint8_t>(at++) = 0x03;
+    Bytes(at, game::kSceneClearCallBytes, sizeof(game::kSceneClearCallBytes));  // lands on kSceneClearCall
+    static const uint8_t kDropTwo[] = {0x83, 0xC4, 0x08, 0xC3};  // add esp,8; ret
+    Bytes(at, kDropTwo, sizeof(kDropTwo));
+    JumpAt(kSceneClearRoutine, CodeAddress(MockSceneClear));
+
+    // The fog routine, which the library detours: the client's first
+    // instructions (push ebp; mov ebp,esp; sub esp,0x14), undone, then the mock.
+    at = game::kSetFog;
+    Bytes(at, game::kSetFogBytes, sizeof(game::kSetFogBytes));
+    static const uint8_t kFogRest[] = {0x8B, 0xE5, 0x5D};  // mov esp,ebp; pop ebp
+    Bytes(at, kFogRest, sizeof(kFogRest));
+    Jump(at, CodeAddress(MockSetFog));
+
+    JumpAt(game::kFindGroupOnLine, CodeAddress(MockFindGroupOnLine));
+    Fixed<uint32_t>(game::kWorldSwitches) = game::kWorldSwitchBuildings | 0x1000001;
+    Fixed<game::OutdoorWindow>(game::kSceneSkyWindow) = game::kNoOutdoorWindow;
+    Fixed<game::OutdoorWindow>(game::kSceneOutdoorWindow) = game::kNoOutdoorWindow;
 
     JumpAt(game::kUpdateShaderProjection, CodeAddress(MockUpdateShaderProjection));
     JumpAt(game::kVisitBuildingGroup, CodeAddress(MockVisit));
@@ -1217,7 +1472,8 @@ void TestVersion() {
         Print(g_lua.pushedString);
         Print("\n");
     }
-    CheckEqual(static_cast<int>(g_lua.pushedNumbers[0]), 31, "and the feature bits: all five parts working");
+    CheckEqual(static_cast<int>(g_lua.pushedNumbers[0]), 63,
+               "and the feature bits: all five parts working, the cutaway being the one that shows buildings from inside");
 }
 
 void TestPlayerPosition() {
@@ -1755,9 +2011,19 @@ struct DrawnFrame {
     game::Matrix standard;  // what the hardware projection is without any cut
     int stackAfterLocate;
     int stackAfterStages;
+    int stackAfterWalk;
+    int stackAfterClear;
+    int stackAfterFog;
     bool walkedFromCamera;  // the client drew from the building it found the camera in
+    bool outdoorWorld;      // the client drew the outdoor world: streets, terrain, the outside of buildings
+    bool sky;               // and the sky
+    uint32_t clearColour;   // what the screen was cleared to before drawing
+    FogCalls fog;           // the fog a building's walls were drawn with
     int setProjectionCalls; // between the scene update and the drawing
 };
+constexpr float kRoomFogStart = 30.0f;  // what the building asks for: fog from 30 yards to 200, whitish
+constexpr float kRoomFogEnd = 200.0f;
+constexpr float kRoomFogDensity = 0.75f;
 DrawnFrame g_drawn;
 bool g_viewTransposed = false;  // a view matrix that does not mean what the library expects
 float g_viewRoll = 0.0f;        // the camera tilted about its line of sight, which a vehicle can do to it
@@ -1797,26 +2063,61 @@ void RenderWorldFrame() {
     game::At<game::Matrix>(g_device, game::kGxDeviceViewStack) = view;
     MockUpdateShaderProjection();
 
-    // The scene update (0x007831A0): where the camera is, and in what.
+    // The scene update (0x007831A0): where the camera is (0x00795400, which
+    // also forgets last frame's windows onto the outdoor world), and in what.
     const game::Vec3 eye = game::At<game::Vec3>(g_camera, game::kCameraPosition);
     Fixed<game::Vec3>(game::kSceneCameraPosition) = eye;
+    Fixed<game::OutdoorWindow>(game::kSceneSkyWindow) = game::kNoOutdoorWindow;
+    Fixed<game::OutdoorWindow>(game::kSceneOutdoorWindow) = game::kNoOutdoorWindow;
     g_visitCount = 0;
     const int callsBefore = g_deviceCalls.setProjection;
     CallClient(game::kLocateCameraCall, nullptr, nullptr, 0, &g_drawn.stackAfterLocate);
 
-    // The scene draw (0x0079A870): from the building the camera is in, or
-    // from outdoors; then the two routines that close the search.
+    // The scene draw (0x0079A870). From the building the camera is in: walk
+    // its rooms, then the outdoor world if the walk found a window onto it.
+    // Or from outdoors, with the whole screen as that window.
     g_drawn.walkedFromCamera = Fixed<void*>(game::kSceneCameraBuilding) != nullptr;
+    g_drawn.stackAfterWalk = 0;
+    if (g_drawn.walkedFromCamera) {
+        CallClient(kWalkRoomsEntry, nullptr, nullptr, 0, &g_drawn.stackAfterWalk);
+    } else {
+        Fixed<game::OutdoorWindow>(game::kSceneSkyWindow) = kWholeScreen;
+        Fixed<game::OutdoorWindow>(game::kSceneOutdoorWindow) = kWholeScreen;
+    }
+    g_drawn.outdoorWorld = Fixed<game::OutdoorWindow>(game::kSceneOutdoorWindow).depth >= 0.0f;
+
+    // Then the two routines that close the search.
     CallClient(game::kFinishVisitsCall, nullptr, nullptr, 0, &g_drawn.stackAfterStages);
 
-    // Drawing happens here, with whatever the device holds now.
+    // The screen is cleared: to the sky's colour where sky will be drawn,
+    // else to the fog's.
+    g_drawn.sky = Fixed<game::OutdoorWindow>(game::kSceneSkyWindow).depth >= 0.0f;
+    g_clearArgument = g_drawn.sky ? kSkyColour : kFogColour;
+    g_clear = {};
+    CallClient(kSceneClearEntry, nullptr, nullptr, 0, &g_drawn.stackAfterClear);
+    g_drawn.clearColour = g_clear.colour;
+
+    // Drawing happens here, with whatever the device holds now. A building's
+    // walls are drawn with the fog the building asks for.
     g_drawn.setProjectionCalls = g_deviceCalls.setProjection - callsBefore;
     g_drawn.hardware = game::At<game::Matrix>(g_device, game::kGxDeviceHardwareProjection);
     g_drawn.shader = g_deviceCalls.shaderProjection;
     g_drawn.view = view;
     g_drawn.eye = eye;
+    static const uint32_t fogColour = kFogColour;
+    const uint32_t fogArguments[4] = {Bits(kRoomFogStart), Bits(kRoomFogEnd), Bits(kRoomFogDensity), Address(&fogColour)};
+    g_fog = {};
+    CallClient(game::kSetFog, nullptr, fogArguments, 4, &g_drawn.stackAfterFog);
+    g_drawn.fog = g_fog;
 
-    // ...and put the device back.
+    // The frame's list of groups to draw is emptied...
+    for (MockBuilding& mock : g_buildings) {
+        for (int i = 0; i < kMaxMockGroups; ++i) {
+            game::At<uint32_t>(mock.placed[i], game::kPlacedGroupQueued) = 0;
+        }
+    }
+
+    // ...and the device put back.
     DeviceSetProjection(saved);
     MockUpdateShaderProjection();
 }
@@ -1980,6 +2281,8 @@ struct CutawayInfo {
     bool refused;
     float overhead;
     float between;
+    bool inside;
+    int framesInside;
 };
 
 CutawayInfo Info() {
@@ -1998,6 +2301,8 @@ CutawayInfo Info() {
     info.refused = n[9] != 0.0;
     info.overhead = static_cast<float>(n[10]);
     info.between = static_cast<float>(n[11]);
+    info.inside = n[12] != 0.0;
+    info.framesInside = static_cast<int>(n[13]);
     return info;
 }
 
@@ -2060,44 +2365,68 @@ constexpr game::Vec3 kJustOverCutEast = {104.0f, 188.0f, 14.2f};
 void TestCutawayOff() {
     Section("cutaway: installed, and off until asked for");
     Check(Fixed<uint8_t>(game::kLocateCameraCall) == 0xE8 && Fixed<uint8_t>(game::kFinishVisitsCall) == 0xE8 &&
-              Fixed<uint8_t>(game::kBeforeDrawingCall) == 0xE8 && Fixed<uint8_t>(game::kCursorRayCall) == 0xE8,
-          "the four calls are still calls");
+              Fixed<uint8_t>(game::kBeforeDrawingCall) == 0xE8 && Fixed<uint8_t>(game::kCursorRayCall) == 0xE8 &&
+              Fixed<uint8_t>(game::kWalkRoomsCall) == 0xE8 && Fixed<uint8_t>(game::kSceneClearCall) == 0xE8,
+          "the six calls are still calls");
     Check(CallTarget(game::kLocateCameraCall, &Fixed<uint8_t>(game::kLocateCameraCall)) != kLocateCameraRoutine &&
               CallTarget(game::kFinishVisitsCall, &Fixed<uint8_t>(game::kFinishVisitsCall)) != kFinishVisitsRoutine &&
               CallTarget(game::kBeforeDrawingCall, &Fixed<uint8_t>(game::kBeforeDrawingCall)) != kBeforeDrawingRoutine &&
-              CallTarget(game::kCursorRayCall, &Fixed<uint8_t>(game::kCursorRayCall)) != kCursorRayRoutine,
+              CallTarget(game::kCursorRayCall, &Fixed<uint8_t>(game::kCursorRayCall)) != kCursorRayRoutine &&
+              CallTarget(game::kWalkRoomsCall, &Fixed<uint8_t>(game::kWalkRoomsCall)) != kWalkRoomsRoutine &&
+              CallTarget(game::kSceneClearCall, &Fixed<uint8_t>(game::kSceneClearCall)) != kSceneClearRoutine,
           "and each now goes to the library");
+    Check(Fixed<uint8_t>(game::kSetFog) == kJumpOpcode, "the fog routine starts with a jump to the library");
 
     g_collisionReturn = 0;
     ResetCamera(g_camera);
     SetCamera(0.0, 60.0, 22.0);
     PlaceBuildings();
     g_outdoors = false;  // the character stands in the house
-    g_cameraStandsIn = g_buildings[0].building;
+    g_characterRoom = {g_buildings[0].building, 1};
+    g_cameraStandsIn = g_buildings[2].building;  // and the camera hangs in the hut next door
+    g_doorToOutdoors = true;
     g_locateCalls = 0;
     g_finishVisits = {};
     g_beforeDrawing = {};
+    g_walk = {};
+    g_lookups = {};
     Fixed<uint32_t>(game::kSceneInteriorPath) = 7;
     RenderWorldFrame();
     RenderWorldFrame();
     CheckEqual(g_locateCalls, 2, "the client's routine still finds what the camera stands in, every frame");
-    Check(g_drawn.walkedFromCamera, "and the client draws from there");
-    CheckEqual(g_drawn.stackAfterLocate, 0, "the stack is as the client left it");
+    CheckPosition(g_locatedFrom, g_drawn.eye, "looking down from the camera, as it always has");
+    Check(g_drawn.walkedFromCamera && g_walk.building == g_buildings[2].building, "and the client draws from there");
+    Check(g_drawn.stackAfterLocate == 0 && g_drawn.stackAfterWalk == 0, "the stack is as the client left it");
     Check(g_finishVisits.count == 2 && g_beforeDrawing.count == 2, "the two routines that close the search still run");
     CheckEqual(g_drawn.stackAfterStages, 0, "with the stack as the client left it");
-    CheckEqual(g_visitCount, 0, "no room is queued that the client did not find itself");
+    CheckEqual(g_visitCount, 1, "no room is queued but the one the client's own walk found");
     Check(SameMatrix(g_drawn.hardware, g_drawn.standard), "the world is drawn with the client's own projection");
     CheckEqual(g_drawn.setProjectionCalls, 0, "which nobody touched");
     Check(Drawn(kRoofOverhead), "so the roof over the character is drawn");
+    Check(g_drawn.outdoorWorld && g_drawn.sky, "through the doorway the walk found, the client draws the outdoor world and the sky");
+    Check(g_clear.count == 1 && g_clear.what == 3 && g_drawn.clearColour == kSkyColour && g_drawn.stackAfterClear == 0,
+          "the screen is cleared the client's way, to the client's colour");
+    Check(g_drawn.fog.count == 1 && g_drawn.fog.colour == kFogColour && g_drawn.stackAfterFog == 0,
+          "the fog is set the client's way, in the building's own colour");
+    CheckNear(g_drawn.fog.start, kRoomFogStart, "from the distance the building asks for");
+    CheckNear(g_drawn.fog.end, kRoomFogEnd, "to the distance it asks for");
+    CheckNear(g_drawn.fog.density, kRoomFogDensity, "as thick as it asks for");
+    CheckEqual(g_lookups.count, 0, "and the library asks the client nothing about rooms");
+    g_cameraStandsIn = nullptr;
+    g_characterRoom = {nullptr, 0};
+    g_doorToOutdoors = false;
 
     const CutawayInfo info = Info();
-    CheckEqual(info.results, 12, "ARPG_CutawayInfo returns twelve values");
+    CheckEqual(info.results, 14, "ARPG_CutawayInfo returns fourteen values");
     Check(!info.asked && !info.cutting && info.framesCut == 0, "nothing asked for, nothing cut");
     Check(info.frames >= 2, "though it has seen the frames go by");
 }
 
+// The cut alone: what there is where the scene's own lookup finds no room
+// under the character although the client's indoors test says there is one.
+// It is also all there was up to 0.3.0.
 void TestCutawayIndoors() {
-    Section("cutaway indoors: ARPG_SetCutaway(4), camera 22 yards out at 60 degrees");
+    Section("the cut alone, indoors: ARPG_SetCutaway(4), camera 22 yards out at 60 degrees");
     g_locateCalls = 0;
     g_finishVisits = {};
     g_beforeDrawing = {};
@@ -2122,16 +2451,21 @@ void TestCutawayIndoors() {
     info = SettleFrames();
     CheckNear(info.height, kCutHeight, "and comes to rest 4 yards over the character's feet");
 
-    Check(g_outdoorsAskedOf == &g_player, "indoors or not is the client's own test, asked of the player's character");
-    CheckEqual(g_locateCalls, 0, "the client's routine no longer looks for what the camera stands in");
+    const game::Vec3 chest = {kFeet.x, kFeet.y, kFeet.z + 1.5f};
+    Check(g_locateCalls > 0, "the client's routine is asked which building the camera is in");
+    CheckPosition(g_locatedFrom, chest, "from the character's chest, and here it finds none");
+    Check(g_outdoorsAskedOf == &g_player, "so the client's own indoors test is asked, of the player's character");
+    Check(info.indoors && !info.inside, "ARPG_CutawayInfo: indoors, but not shown from inside");
     Check(Fixed<void*>(game::kSceneCameraBuilding) == nullptr && Fixed<void*>(game::kSceneCameraBuildingSecond) == nullptr &&
-              Fixed<uint32_t>(game::kSceneCameraGroupCount) == 0 && Fixed<uint32_t>(game::kSceneCameraGroupCountSecond) == 0 &&
-              Fixed<char>(game::kSceneCameraBuildingName) == '\0' && Fixed<char>(game::kSceneCameraGroupName) == '\0',
-          "the scene is told the camera stands in no building, the way the client's routine tells it");
-    Check(!g_drawn.walkedFromCamera, "so the client draws the outdoor world");
+              Fixed<uint32_t>(game::kSceneCameraGroupCount) == 0 && Fixed<uint32_t>(game::kSceneCameraGroupCountSecond) == 0,
+          "the scene has no building for the camera");
+    Check(!g_drawn.walkedFromCamera && g_drawn.outdoorWorld && g_drawn.sky && g_drawn.clearColour == kSkyColour,
+          "so the client draws the outdoor world, sky and all");
+    Check(g_drawn.fog.colour == kFogColour && Thousandths(g_drawn.fog.start) == Thousandths(kRoomFogStart),
+          "with the fog as it is");
     CheckEqual(g_drawn.stackAfterLocate, 0, "the stack is as the client left it");
 
-    Section("cutaway indoors: the rooms");
+    Section("the cut alone, indoors: the rooms");
     CheckEqual(g_visitCount, 3, "three rooms are queued for drawing");
     Check(Visited(0, 1, 1), "the room the character stands in, as a room reached indoors");
     Check(Visited(0, 4, 0), "the courtyard lit by the sky, as one that is not");
@@ -2153,7 +2487,7 @@ void TestCutawayIndoors() {
     CheckEqual(g_visitCount, 0, "with the scene's view narrowed to a doorway, no room is queued");
     Fixed<int32_t>(game::kSceneFrustumLevel) = 0;
 
-    Section("cutaway indoors: the cut");
+    Section("the cut alone, indoors: the cut");
     RenderWorldFrame();
     Check(SameMatrix(g_finishVisits.projection, WorldProjection()) && SameMatrix(g_beforeDrawing.projection, WorldProjection()),
           "while the client works out what is in view, the projection is still its own");
@@ -2531,13 +2865,10 @@ void TestCutawayTallRooms() {
 
     Section("cutaway indoors: a hall higher than the camera");
     g_slabs[0] = {true, 60.0f, 61.0f, kEverywhere};
-    g_cameraStandsIn = g_buildings[0].building;
     FramesFor(300);
-    g_locateCalls = 0;
     info = SettleFrames();
     Check(!info.cutting && info.indoors, "a hall higher than the camera is left whole");
-    Check(g_locateCalls > 0 && g_drawn.walkedFromCamera && SameMatrix(g_drawn.hardware, g_drawn.standard),
-          "and drawn the client's own way, from the room the camera is in");
+    Check(SameMatrix(g_drawn.hardware, g_drawn.standard), "and drawn with the client's own projection");
 
     g_slabs[1] = {true, 18.0f, 30.0f, 97.0f};  // a pillar's worth of masonry south of the character
     FramesFor(600);
@@ -2555,10 +2886,380 @@ void TestCutawayTallRooms() {
     Check(!info.cutting, "and the hall is whole again when it is out of the way");
 
     g_slabs[0].present = false;
-    g_cameraStandsIn = nullptr;
     SetCutaway(kCutHeight);
     info = SettleFrames();
     CheckNear(info.height, kCutHeight, "indoors with no roof found at all: the look upwards is not believed, cut as asked");
+}
+
+// ---------------------------------------------------------------------------
+// The inside view
+// ---------------------------------------------------------------------------
+
+float Root(float value) {
+    float root = value > 1.0f ? value * 0.5f : 1.0f;
+    for (int i = 0; i < 40; ++i) {
+        root = 0.5f * (root + value / root);
+    }
+    return root;
+}
+
+float Apart(const game::Vec3& a, const game::Vec3& b) {
+    return Root((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z));
+}
+
+int Visits(int building, uint32_t index, int32_t level, bool first) {
+    int found = 0;
+    const int count = g_visitCount < kMaxVisits ? g_visitCount : kMaxVisits;
+    for (int i = 0; i < count; ++i) {
+        if (g_visits[i].building == g_buildings[building].building && g_visits[i].index == index &&
+            g_visits[i].level == level && g_visits[i].first == first) {
+            ++found;
+        }
+    }
+    return found;
+}
+
+int VisitsOf(int building, uint32_t index) {
+    return Visits(building, index, 0, true) + Visits(building, index, 0, false) + Visits(building, index, 1, true) +
+           Visits(building, index, 1, false);
+}
+
+bool WindowShut(uintptr_t address) {
+    const game::OutdoorWindow& window = Fixed<game::OutdoorWindow>(address);
+    return window.left > 1e38f && window.top > 1e38f && window.right < -1e38f && window.bottom < -1e38f &&
+           window.depth == -1.0f;
+}
+
+constexpr uint32_t kBlack = 0xFF000000;
+constexpr uint32_t kRoomOfCharacter = 1;  // in the house: see PlaceBuildings
+constexpr uint32_t kRoomUpstairs = 2;
+constexpr uint32_t kCourtyard = 4;
+
+// The cursor's ray from the camera through a point, as the client's routine
+// builds it, put through the library's hook. Returns where the ray starts
+// once the library is done with it.
+game::Vec3 CursorRayThrough(const game::Vec3& target) {
+    g_rayStart = g_drawn.eye;
+    g_rayEnd = {g_drawn.eye.x + (target.x - g_drawn.eye.x) * 3.0f, g_drawn.eye.y + (target.y - g_drawn.eye.y) * 3.0f,
+                g_drawn.eye.z + (target.z - g_drawn.eye.z) * 3.0f};
+    g_rayFound = true;
+    static game::Vec3 start;
+    static game::Vec3 end;
+    start = {};
+    end = {};
+    g_rayArguments[0] = Bits(0.5f);
+    g_rayArguments[1] = Bits(0.5f);
+    g_rayArguments[2] = Address(&start);
+    g_rayArguments[3] = Address(&end);
+    g_rayThis = g_worldFrame;
+    g_intersect = {};
+    g_lookups = {};
+    int popped = -1;
+    CallClient(kCursorHitTest, nullptr, nullptr, 0, &popped);
+    return start;
+}
+
+// Whether a point lies on the client's ray, and at which height the ray
+// passes a wall running east to west at `x`.
+bool OnTheRay(const game::Vec3& point) {
+    const float along = (point.z - g_rayStart.z) / (g_rayEnd.z - g_rayStart.z);
+    return along >= 0.0f && along <= 1.0f &&
+           Magnitude(g_rayStart.x + (g_rayEnd.x - g_rayStart.x) * along - point.x) < 0.001f &&
+           Magnitude(g_rayStart.y + (g_rayEnd.y - g_rayStart.y) * along - point.y) < 0.001f;
+}
+
+float RayHeightAt(float x) {
+    return g_rayStart.z + (g_rayEnd.z - g_rayStart.z) * (x - g_rayStart.x) / (g_rayEnd.x - g_rayStart.x);
+}
+
+void TestInsideView() {
+    Section("inside view: the scene is drawn from the room the character is in");
+    SetCamera(0.0, 60.0, 22.0);
+    g_playerPosition = kFeet;
+    g_outdoors = false;
+    g_characterRoom = {g_buildings[0].building, kRoomOfCharacter};
+    g_cameraStandsIn = g_buildings[2].building;      // the camera itself hangs in the hut next door
+    g_slabs[0] = {true, 15.0f, 16.0f, kEverywhere};  // the room's ceiling, 5 yards up
+    g_slabs[1].present = false;
+    g_walkReachCount = 0;
+    g_doorToOutdoors = false;
+    g_roomShowsSky = false;
+    Fixed<uint32_t>(game::kSceneInteriorPath) = 7;
+    SetCutaway(kCutHeight);
+    g_locateCalls = 0;
+    g_walk = {};
+    RenderWorldFrame();
+    const game::Vec3 chest = {kFeet.x, kFeet.y, kFeet.z + 1.5f};
+    CheckEqual(g_locateCalls, 1, "the client's routine is asked, once a frame, which building the camera is in");
+    CheckPosition(g_locatedFrom, chest, "and asked from the character's chest, not from the camera");
+    CheckPosition(Fixed<game::Vec3>(game::kSceneCameraPosition), g_drawn.eye,
+                  "after which the camera's position is back as it was");
+    Check(g_drawn.walkedFromCamera && Fixed<void*>(game::kSceneCameraBuilding) == g_buildings[0].building,
+          "so the scene is drawn from the house, not from the hut the camera hangs in");
+    CheckEqual(g_walk.count, 1, "the client walks the house's rooms");
+    Check(g_walk.building == g_buildings[0].building && g_walk.groups == reinterpret_cast<void*>(kCameraGroupList),
+          "with the building and the list of groups the client gave it");
+    CheckPosition(g_walk.camera, g_drawn.eye, "and judges the doorways from where the camera really is");
+    Check(g_drawn.stackAfterLocate == 0 && g_drawn.stackAfterWalk == 0 && g_drawn.stackAfterStages == 0 &&
+              g_drawn.stackAfterClear == 0 && g_drawn.stackAfterFog == 0,
+          "after each of the redirected calls the stack is as the client left it");
+    CutawayInfo info = Info();
+    Check(info.asked && info.indoors && info.inside && info.framesInside > 0,
+          "ARPG_CutawayInfo: in a building, shown from inside");
+
+    g_outdoors = true;  // a place one may ride in: the client's indoors test says "outdoors"
+    RenderWorldFrame();
+    Check(Info().inside && g_drawn.walkedFromCamera, "the scene's own answer counts, whatever the client's indoors test says");
+    g_outdoors = false;
+
+    Section("inside view: nothing of the outdoor world");
+    g_doorToOutdoors = true;
+    g_roomShowsSky = true;
+    RenderWorldFrame();
+    Check(!g_drawn.outdoorWorld, "a doorway to the street is in view: the outdoor world is not drawn all the same");
+    Check(!g_drawn.sky, "nor the sky, even from a room the client shows the whole sky from");
+    Check(WindowShut(game::kSceneOutdoorWindow) && WindowShut(game::kSceneSkyWindow),
+          "both windows onto it are shut exactly the way the client shuts them");
+    Check(g_clear.count == 1 && g_clear.what == 3 && g_drawn.clearColour == kBlack,
+          "the screen is cleared once, as the client asked, but to black");
+    const float away = Apart(g_drawn.eye, chest);
+    Check(g_drawn.fog.count == 1 && g_drawn.fog.colour == kBlack, "the room's fog fades to black instead of to its own colour");
+    CheckNear(g_drawn.fog.start, kRoomFogStart + away, "and starts as far beyond the character as it used to beyond the camera");
+    CheckNear(g_drawn.fog.end, kRoomFogEnd + away, "ending that much further off too");
+    CheckNear(g_drawn.fog.density, kRoomFogDensity, "no thicker and no thinner");
+    g_roomShowsSky = false;
+
+    Section("inside view: the rooms and what is in them");
+    g_walkReaches[0] = kCourtyard;  // seen through a doorway
+    g_walkReachCount = 1;
+    g_visitsOfUnreadyGroups = 0;
+    g_finishVisits = {};
+    RenderWorldFrame();
+    Check(Visits(0, kRoomOfCharacter, 0, true) == 1 && Visits(0, kCourtyard, 1, true) == 1,
+          "the client's walk queues the character's room, and the courtyard as its doorway frames it");
+    Check(Visits(0, kCourtyard, 0, false) == 1,
+          "the library visits the courtyard once more with the whole screen as its frame");
+    Check(Visits(0, kRoomOfCharacter, 0, false) == 1, "and the character's room likewise");
+    CheckEqual(g_visitCount, 4, "that is all: no room is drawn that the walk did not reach");
+    Check(VisitsOf(0, 0) == 0 && VisitsOf(0, kRoomUpstairs) == 0 && VisitsOf(0, 5) == 0 && VisitsOf(2, 0) == 0,
+          "not the house's outer shell, not the room upstairs, not the far wing, not the hut next door");
+    CheckEqual(g_visitsOfUnreadyGroups, 0, "and nothing the visit routine would crash on");
+    CheckEqual(g_finishVisits.visitsSeen, 4, "all before the client goes through the visited rooms");
+    bool unmarked = true;
+    for (int i = 0; i < g_visitCount && i < kMaxVisits; ++i) {
+        unmarked = unmarked && (g_visits[i].first || g_visits[i].interiorPath == 0);
+    }
+    Check(unmarked, "the second visits leave the rooms marked as the client's walk marked them");
+    CheckEqual(static_cast<int>(Fixed<uint32_t>(game::kSceneInteriorPath)), 7, "and the client's marker is back as it was");
+    CheckEqual(Info().rooms, 2, "ARPG_CutawayInfo counts two rooms");
+
+    g_walkLeavesViewNarrowed = true;
+    RenderWorldFrame();
+    CheckEqual(g_visitCount, 2, "with the scene's view left narrowed to a doorway, the library visits nothing");
+    g_walkLeavesViewNarrowed = false;
+    Fixed<int32_t>(game::kSceneFrustumLevel) = 0;
+
+    Section("inside view: the cut");
+    info = SettleFrames();
+    CheckNear(info.height, kCutHeight, "under a roof lower than the camera the cut is made as before, 4 yards over the feet");
+    Check(g_drawn.setProjectionCalls == 1 && Drawn(kFeet) && Drawn(kJustUnderCut) && !Drawn(kJustOverCut) &&
+              !Drawn(kRoofOverhead) && SameSpotOnScreen(kFeet),
+          "what is higher is cut away, and nothing moves on screen");
+    CheckNear(info.overhead, 5.0f, "ARPG_CutawayInfo has the ceiling 5 yards overhead");
+    g_intersect = {};
+    RenderWorldFrame();
+    Check(g_intersect.count > 0 && g_intersect.slanted == 0,
+          "only straight up is looked at: where walls are seen through, the line of sight is not asked about");
+    CheckNear(Info().between, 0.0f, "and ARPG_CutawayInfo reports nothing in between");
+
+    g_slabs[0] = {true, 22.0f, 23.0f, kEverywhere};
+    FramesFor(2200);
+    info = SettleFrames();
+    CheckNear(info.height, 12.0f - 0.3f, "a tall room keeps its walls: cut just under the ceiling");
+    g_slabs[1] = {true, 18.0f, 18.5f, 97.0f};  // a gallery on the camera's side
+    FramesFor(400);
+    CheckNear(Info().height, 12.0f - 0.3f, "and a gallery between camera and character does not bring the cut down");
+    g_slabs[1].present = false;
+    g_slabs[0] = {true, 13.5f, 14.5f, kEverywhere};
+    info = SettleFrames();
+    CheckNear(info.height, 3.5f - 0.3f, "a ceiling lower than the cut asked for: cut just under it, here too");
+
+    Section("inside view: a hall higher than the camera");
+    g_slabs[0] = {true, 60.0f, 61.0f, kEverywhere};
+    FramesFor(300);
+    info = SettleFrames();
+    Check(!info.cutting && info.inside, "nothing is cut");
+    Check(SameMatrix(g_drawn.hardware, g_drawn.standard), "the client's own projection draws it");
+    Check(!g_drawn.outdoorWorld && !g_drawn.sky && g_drawn.clearColour == kBlack,
+          "still nothing of the outdoor world, and black where the doorway shows out");
+    Check(g_drawn.fog.colour == kFogColour, "but the hall keeps its own fog: the camera is in it");
+    CheckNear(g_drawn.fog.start, kRoomFogStart, "from where the hall asks");
+    CheckNear(g_drawn.fog.end, kRoomFogEnd, "to where it asks");
+    SetCutawayOutdoorsToo(kCutHeight);
+    g_slabs[1] = {true, 18.0f, 30.0f, 97.0f};  // a pillar's worth of masonry south of the character
+    FramesFor(600);
+    info = Info();
+    Check(!info.cutting && !info.blocked, "a pillar between camera and character is no reason to cut in here, asked for or not");
+
+    // Walking in from the street, where that masonry did count.
+    g_characterRoom = {nullptr, 0};
+    g_outdoors = true;
+    g_slabs[0].present = false;
+    FramesFor(400);
+    info = SettleFrames();
+    Check(info.cutting && info.blocked && !info.inside, "(out in the street the same masonry is in the way, and cut)");
+    g_characterRoom = {g_buildings[0].building, kRoomOfCharacter};
+    g_outdoors = false;
+    g_slabs[0] = {true, 60.0f, 61.0f, kEverywhere};
+    RenderWorldFrame();
+    info = Info();
+    Check(info.inside && !info.blocked, "one step into the hall and it no longer counts");
+    info = SettleFrames();
+    Check(!info.cutting, "the cut from the street slides away");
+    g_slabs[1].present = false;
+    SetCutaway(kCutHeight);
+
+    Section("inside view: the cursor's ray");
+    // The room the character is in, A, from x = 95 to 115 with its ceiling 6
+    // yards up. North of it a side room, B, with a ceiling 3 yards up, which
+    // the walk reaches. South of it, on the camera's side, a room C that is
+    // not drawn. A wall between C and A.
+    void* const house = g_buildings[0].building;
+    g_slabs[0] = {true, 16.0f, 16.5f, 115.0f, 95.0f};
+    g_slabs[1] = {true, 13.0f, 13.2f, 125.0f, 115.0f};
+    g_lookupRooms[0] = {true, 95.0f, 115.0f, 10.0f, 16.0f, house, kRoomOfCharacter, true};
+    g_lookupRooms[1] = {true, 115.0f, 125.0f, 10.0f, 13.0f, house, kCourtyard, true};
+    g_lookupRooms[2] = {true, 85.0f, 95.0f, 10.0f, 16.0f, house, kRoomUpstairs, true};
+    g_walls[0] = {true, 95.0f, 10.0f, 16.0f};
+    FramesFor(1300);
+    info = SettleFrames();
+    CheckNear(info.height, kCutHeight, "(cut at 4 yards, the character's room and the side room drawn)");
+    const float cut = kFeet.z + kCutHeight;
+
+    const game::Vec3 middleOfRoom = {105.0f, 200.0f, 10.0f};
+    game::Vec3 start = CursorRayThrough(middleOfRoom);
+    CheckNear(start.z, cut, "onto the middle of the floor: the ray starts at the cut, as before");
+    Check(OnTheRay(start), "on the client's own line");
+    Check(g_lookups.count == 2 && g_lookups.slanted == 0 && g_lookups.fractionNotOne == 0,
+          "the client is asked what lies straight below that point and straight above it, over the whole of each line");
+    CheckEqual(g_intersect.click, 0, "both are the character's room, so the ray is left there");
+
+    const game::Vec3 byTheNearWall = {95.8f, 200.0f, 10.0f};
+    start = CursorRayThrough(byTheNearWall);
+    const float wallHeight = RayHeightAt(95.0f);
+    Check(wallHeight > kFeet.z + 1.0f && wallHeight < cut, "(a ray that goes through the near wall below the cut)");
+    Check(start.x > 95.0f && start.x < 95.2f && OnTheRay(start),
+          "onto the floor just inside the near wall: the ray is picked up just past the wall, which is not on screen");
+    CheckNear(start.z, RayHeightAt(start.x), "at the height it comes through");
+    CheckEqual(g_intersect.click, 1, "one surface was in its way");
+    CheckEqual(static_cast<int>(g_intersect.flags), static_cast<int>(game::kIntersectClick),
+               "found with the very test the client's click makes");
+    CheckEqual(static_cast<int>(g_intersect.last), 0, "(and the routine's last argument as the client passes it)");
+    g_lookupRooms[2].present = false;  // the same with the street outside that wall instead of a room
+    start = CursorRayThrough(byTheNearWall);
+    Check(start.x > 95.0f && start.x < 95.2f, "the same with the street on the camera's side of the wall");
+    g_lookupRooms[2] = {true, 85.0f, 95.0f, 10.0f, 16.0f, g_buildings[2].building, kRoomOfCharacter, true};
+    start = CursorRayThrough(byTheNearWall);
+    Check(start.x > 95.0f && start.x < 95.2f,
+          "and with the house next door there, whose rooms are numbered like this one's but are not drawn");
+    g_lookupRooms[2] = {true, 85.0f, 95.0f, 10.0f, 16.0f, house, kRoomUpstairs, true};
+
+    const game::Vec3 inTheSideRoom = {124.0f, 200.0f, 10.0f};
+    start = CursorRayThrough(inTheSideRoom);
+    Check(start.x > 115.0f && start.z < 13.0f && start.z > 12.8f && OnTheRay(start),
+          "onto the side room's floor: the ray comes down above its ceiling, and is picked up under it");
+    CheckEqual(g_intersect.click, 2, "past the two faces of that ceiling");
+
+    g_walls[1] = {true, 110.0f, 10.0f, 16.0f};  // a wall inside the character's room, seen from in front
+    const game::Vec3 behindThatWall = {112.0f, 200.0f, 10.0f};
+    start = CursorRayThrough(behindThatWall);
+    CheckNear(start.z, cut, "a wall inside the room, which is on screen: the ray is not taken past it");
+    Check(start.x < 110.0f, "it starts in front of it, for the click to land on");
+    g_walls[1].present = false;
+
+    for (int i = 1; i < kWalls; ++i) {
+        g_walls[i] = {true, 94.55f + 0.05f * static_cast<float>(i), 10.0f, 16.0f};  // seven more walls before the room
+    }
+    game::Vec3 expected = {};
+    {
+        const game::Vec3 eye = g_drawn.eye;
+        const float along = (eye.z - cut) / (eye.z - byTheNearWall.z);
+        expected = {eye.x + (byTheNearWall.x - eye.x) * along, eye.y + (byTheNearWall.y - eye.y) * along, cut};
+    }
+    start = CursorRayThrough(byTheNearWall);
+    Check(expected.x < 94.6f, "(all eight walls lie between the cut and the room)");
+    CheckPosition(start, expected, "more unseen surfaces than it will go through: the ray is left where the cut put it");
+    CheckEqual(g_intersect.click, 7, "after seven tries");
+    for (int i = 1; i < kWalls; ++i) {
+        g_walls[i].present = false;
+    }
+
+    g_lookupRooms[0].present = false;
+    g_lookupRooms[1].present = false;
+    start = CursorRayThrough(byTheNearWall);
+    CheckPosition(start, expected, "a ray that never gets into a room that is drawn is left where the cut put it");
+    g_lookupRooms[0].present = true;
+    g_lookupRooms[1].present = true;
+
+    g_walkReachCount = 0;  // the side room is no longer reached, so no longer drawn
+    RenderWorldFrame();
+    start = CursorRayThrough(inTheSideRoom);
+    CheckNear(start.z, cut, "the side room not drawn: a ray into it is not taken past its ceiling");
+    g_walkReaches[0] = kCourtyard;
+    g_walkReachCount = 1;
+    RenderWorldFrame();
+
+    Fixed<uint32_t>(game::kWorldSwitches) &= ~game::kWorldSwitchBuildings;
+    start = CursorRayThrough(byTheNearWall);
+    Check(g_lookups.count == 0 && g_intersect.click == 0, "with buildings switched off in the client, it asks nothing");
+    CheckPosition(start, expected, "and leaves the ray where the cut put it");
+    Fixed<uint32_t>(game::kWorldSwitches) |= game::kWorldSwitchBuildings;
+
+    g_rayFound = false;
+    static game::Vec3 untouched;
+    untouched = {1.0f, 2.0f, 3.0f};
+    g_rayArguments[2] = Address(&untouched);
+    g_lookups = {};
+    int popped = -1;
+    CallClient(kCursorHitTest, nullptr, nullptr, 0, &popped);
+    Check(g_rayResult == 0 && untouched.x == 1.0f && untouched.z == 3.0f && g_lookups.count == 0,
+          "a cursor that is not over the world: nothing asked, nothing written");
+    g_rayFound = true;
+
+    Section("inside view: out of the building again");
+    g_characterRoom = {nullptr, 0};
+    g_outdoors = true;
+    g_cameraStandsIn = g_buildings[2].building;  // the camera still hangs in the hut
+    for (LookupRoom& room : g_lookupRooms) {
+        room.present = false;
+    }
+    g_walls[0].present = false;
+    g_slabs[0].present = false;
+    g_slabs[1].present = false;
+    RenderWorldFrame();
+    Check(!g_drawn.walkedFromCamera, "under the open sky the scene is drawn from outdoors, not from the hut the camera hangs in");
+    Check(g_drawn.outdoorWorld && g_drawn.sky && g_drawn.clearColour == kSkyColour,
+          "the outdoor world, the sky and the client's own background are back on the very next frame");
+    Check(g_drawn.fog.colour == kFogColour && Thousandths(g_drawn.fog.start) == Thousandths(kRoomFogStart) &&
+              Thousandths(g_drawn.fog.end) == Thousandths(kRoomFogEnd),
+          "and so is the fog");
+    info = Info();
+    Check(!info.inside && !info.indoors, "ARPG_CutawayInfo: not in a building");
+    start = CursorRayThrough(middleOfRoom);
+    CheckEqual(g_lookups.count, 0, "the cursor's ray asks nothing about rooms out here");
+    info = SettleFrames();
+    Check(!info.cutting && SameMatrix(g_drawn.hardware, g_drawn.standard), "the cut slides away");
+
+    CutawayOff();
+    g_walkReachCount = 0;  // the hut has one room
+    g_doorToOutdoors = false;
+    g_locateCalls = 0;
+    RenderWorldFrame();
+    CheckPosition(g_locatedFrom, g_drawn.eye, "switched off, the client's routine is asked from the camera again");
+    Check(g_drawn.walkedFromCamera, "and the scene is drawn from wherever that is");
+    g_cameraStandsIn = nullptr;
+    g_outdoors = false;
+    SetCutaway(kCutHeight);
 }
 
 void TestCutawayRefusals() {
@@ -2606,7 +3307,17 @@ void TestCutawayRefusals() {
     g_locateCalls = 0;
     RenderWorldFrame();
     Check(g_drawn.setProjectionCalls == 0 && g_locateCalls == 1 && g_visitCount == 0,
-          "and leaves the frame entirely to the client");
+          "and leaves the device's projection and the rooms to the client");
+    g_characterRoom = {g_buildings[0].building, kRoomOfCharacter};
+    g_doorToOutdoors = true;
+    RenderWorldFrame();
+    info = Info();
+    Check(info.inside && !info.cutting && g_drawn.setProjectionCalls == 0,
+          "the inside view needs no cut: it goes on without one");
+    Check(g_drawn.walkedFromCamera && !g_drawn.outdoorWorld && g_drawn.clearColour == kBlack,
+          "the house from inside, nothing of the outdoor world, black behind");
+    g_characterRoom = {nullptr, 0};
+    g_doorToOutdoors = false;
     g_deviceRescalesDepth = true;
     RenderWorldFrame();
     Check(Info().refused, "it stays that way for the rest of this UI");
@@ -2687,6 +3398,7 @@ int MockMain() {
     TestCutawayMoving();
     TestCutawayOutdoors();
     TestCutawayTallRooms();
+    TestInsideView();
     TestCutawayRefusals();
     TestUiReload();
 

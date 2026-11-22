@@ -299,6 +299,8 @@ constexpr size_t kGroupLinkGroup = 0x04;  // in a group link: the placed group
 // A placed group.
 constexpr size_t kPlacedGroupBounds = 0x24;  // Box, world coordinates
 constexpr size_t kPlacedGroupIndex = 0x50;   // uint32_t: which of the model's groups
+constexpr size_t kPlacedGroupQueued = 0xB4;  // nonzero while the group is on this frame's list of groups to
+                                             // draw (0x00CDB080): the visit looks at this to queue it once
 
 // A building's model.
 constexpr size_t kModelGroupInfo = 0x130;   // array of 0x20-byte records, one per group, flags first
@@ -363,6 +365,55 @@ inline bool IntersectWorld(const Vec3& from, const Vec3& to, Vec3* hit, float* f
     return reinterpret_cast<bool (__cdecl*)(const Vec3*, const Vec3*, Vec3*, float*, uint32_t, uint32_t)>(
         kIntersectWorld)(&from, &to, hit, fraction, flags, 0);
 }
+
+// The same against everything a click can land on: what the client's click
+// test passes (0x004F9B5C). Terrain, buildings as far as they block
+// movement, models, game objects.
+constexpr uint32_t kIntersectClick = 0x00100151;
+
+// bool __cdecl (const Vec3* from, const Vec3* to, float fraction,
+// void* buildings[2], uint32_t groups[4]): the building group whose surface
+// the line meets first, among the placed buildings. The client asks this
+// with a line straight down from the camera to learn which room the camera
+// is in (0x00795D40); it is a plain line-against-surfaces test and takes
+// any line. `fraction` limits how far along the line counts (1: all of
+// it). Returns false, and null in buildings[0], if the line meets nothing
+// or if what it meets first is an outdoor group (kGroupFlagOutdoor).
+// Otherwise buildings[0] is the placed building and groups[0] the group.
+constexpr uintptr_t kFindGroupOnLine = 0x007D59B0;
+
+inline bool FindGroupOnLine(const Vec3& from, const Vec3& to, void** buildings, uint32_t* groups) {
+    return reinterpret_cast<bool (__cdecl*)(const Vec3*, const Vec3*, float, void**, uint32_t*)>(
+        kFindGroupOnLine)(&from, &to, 1.0f, buildings, groups);
+}
+
+// uint32_t: world switches. With this bit clear the client draws and tests
+// no buildings at all, and asks none of the questions above.
+constexpr uintptr_t kWorldSwitches = 0x00CD774C;
+constexpr uint32_t kWorldSwitchBuildings = 0x100;
+
+// While the scene is drawn from inside a building, two rectangles of the
+// screen (as fractions, 0 to 1) through which the outdoor world shows:
+// doorways and windows the walk through the rooms has come across. They are
+// emptied in every scene update (0x00795400). After the walk, the first is
+// what decides whether the sky is drawn and which colour the screen is
+// cleared to, and weather and light look at it too; the second is handed to
+// the outdoor culling (0x0079A790), which is skipped if it is empty.
+struct OutdoorWindow {
+    float left, top, right, bottom;
+    float depth;  // below zero: the outdoor world does not show at all
+};
+constexpr uintptr_t kSceneSkyWindow = 0x00ADF570;
+constexpr uintptr_t kSceneOutdoorWindow = 0x00ADF58C;
+constexpr OutdoorWindow kNoOutdoorWindow = {3.4028234664e38f, 3.4028234664e38f, -3.4028234664e38f,
+                                            -3.4028234664e38f, -1.0f};
+
+// void __cdecl (float start, float end, float density, const uint32_t*
+// colour): sets the fog for what is drawn next. Buildings (0x007A8440,
+// 0x007A9380) and models (0x0081F9E0) set theirs through this; terrain does
+// not. Colour is 0xAARRGGBB.
+constexpr uintptr_t kSetFog = 0x00873210;
+constexpr uint8_t kSetFogBytes[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14};
 
 // bool __thiscall CGUnit(): whether the unit is outdoors; the client's
 // IsIndoors() and IsOutdoors() are this test on the player (0x00612300).
@@ -467,6 +518,21 @@ constexpr uintptr_t kFinishVisitsCall = 0x0079AB2A;
 constexpr uint8_t kFinishVisitsCallBytes[] = {0xE8, 0x31, 0xF7, 0xFF, 0xFF};
 constexpr uintptr_t kBeforeDrawingCall = 0x0079AB2F;
 constexpr uint8_t kBeforeDrawingCallBytes[] = {0xE8, 0x1C, 0x89, 0xFF, 0xFF};
+
+// In the scene draw, when the camera stands in a building:
+// void __thiscall PlacedBuilding(void* groups) (0x007B3B20), the walk from
+// the camera's groups through doorways to every room in view. It hands the
+// client's camera position (kSceneCameraPosition) to the routine that
+// judges each doorway (0x007AD1F0). Right after it the client looks at
+// kSceneOutdoorWindow to see whether to draw the outdoor world as well.
+constexpr uintptr_t kWalkRoomsCall = 0x0079AA2C;
+constexpr uint8_t kWalkRoomsCallBytes[] = {0xE8, 0xEF, 0x90, 0x01, 0x00};
+
+// In the scene draw, after kBeforeDrawingCall: void __cdecl (uint32_t what,
+// uint32_t colour) (0x006813B0), clears the screen. `what` is 3; the colour
+// is the fog's when no sky shows.
+constexpr uintptr_t kSceneClearCall = 0x0079AB9A;
+constexpr uint8_t kSceneClearCallBytes[] = {0xE8, 0x11, 0x68, 0xEE, 0xFF};
 
 // In the cursor's hit test (0x004F9DA0), which first sets the device's
 // projection afresh from the camera:

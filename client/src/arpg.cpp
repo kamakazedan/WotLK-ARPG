@@ -1,7 +1,7 @@
 // WotLK-ARPG client library.
 //
 // What the Lua sandbox cannot do: move by holding the mouse button, pin the
-// camera, and take the roof off the building the character is in (that last
+// camera, and show the building the character is in from inside (that last
 // one is in cutaway.cpp). The library keeps no settings of its own; the addon
 // pushes them in through the Lua functions registered at the bottom of this
 // file, and they are dropped again whenever the UI reloads.
@@ -12,7 +12,7 @@
 #include "log.h"
 #include "win.h"
 
-#define ARPG_VERSION "0.3.0"
+#define ARPG_VERSION "0.4.0"
 
 namespace {
 
@@ -25,6 +25,7 @@ enum Feature : uint32_t {
     kFeatureCameraAngles = 4,
     kFeatureCameraDistance = 8,
     kFeatureCutaway = 16,
+    kFeatureInsideView = 32,  // the cutaway shows buildings from inside (0.4.0); set together with 16
 };
 uint32_t g_features = 0;
 
@@ -539,7 +540,7 @@ void Attach(void* self) {
     }
 
     if (cutaway::Install()) {
-        g_features |= kFeatureCutaway;
+        g_features |= kFeatureCutaway | kFeatureInsideView;
     }
 
     const auto state = [](uint32_t feature) { return (g_features & feature) != 0 ? "on" : "OFF"; };
