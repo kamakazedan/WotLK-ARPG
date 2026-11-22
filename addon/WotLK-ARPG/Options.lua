@@ -5,6 +5,10 @@
 
     Sliders: drag, or roll the mouse wheel for single steps; right-click puts
     a slider back to its default. The Defaults button resets the whole panel.
+
+    The panel the client gives an addon is about 400 units wide and 415 high
+    (3.3.5a, whatever the UI scale). Everything here has to fit in that:
+    the camera sliders sit two to a row for it.
 ]]
 
 local ADDON, ns = ...
@@ -18,9 +22,11 @@ title:SetPoint("TOPLEFT", 16, -16)
 title:SetText("WotLK-ARPG")
 
 local note = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-note:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -6)
-note:SetWidth(380)
+note:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
+note:SetWidth(376)
+note:SetHeight(24) -- two lines at most
 note:SetJustifyH("LEFT")
+note:SetJustifyV("TOP")
 
 local function heading(text, offsetY)
     local label = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
@@ -39,7 +45,7 @@ local function makeSlider(key, spec)
     local name = "WotLKARPGOptions_" .. key
     local slider = CreateFrame("Slider", name, panel, "OptionsSliderTemplate")
     slider:SetPoint("TOPLEFT", spec.x or 24, spec.y)
-    slider:SetWidth(spec.width or 260)
+    slider:SetWidth(spec.width or 165)
     slider:SetMinMaxValues(spec.low, spec.high)
     slider:SetValueStep(1)
     _G[name .. "Low"]:SetText(spec.lowText)
@@ -100,7 +106,7 @@ local checks = {}
 local function makeCheck(key, spec)
     local name = "WotLKARPGOptions_" .. key
     local check = CreateFrame("CheckButton", name, panel, "InterfaceOptionsCheckButtonTemplate")
-    check:SetPoint("TOPLEFT", spec.x or 20, spec.y)
+    check:SetPoint("TOPLEFT", spec.x or 16, spec.y)
     _G[name .. "Text"]:SetText(spec.label)
     check.tooltipText = spec.tooltip
     check.setFunc = function(value)
@@ -127,29 +133,29 @@ end
 -- Camera
 ---------------------------------------------------------------------------
 
-heading("Camera", -76)
+heading("Camera", -66)
 
 makeSlider("camPitch", {
-    y = -112, low = 10, high = 89, lowText = "Flat", highText = "Top-down",
+    x = 24, y = -98, low = 10, high = 89, lowText = "Flat", highText = "Top-down",
     text = function(value) return format("Camera angle: %d°", value) end,
     tooltip = "How steeply the camera looks down at your character.",
     apply = applyCamera,
 })
 
 makeSlider("camDistance", {
-    y = -162, low = 5, high = 100, lowText = "Near", highText = "Far",
+    x = 214, y = -98, low = 5, high = 100, lowText = "Near", highText = "Far",
     text = function(value) return format("Camera distance: %d yd", value) end,
     tooltip = "How far the camera is from your character. Further away shows more of the world, smaller.",
     apply = applyCamera,
 })
 
 makeSlider("camYaw", {
-    y = -212, low = -180, high = 180, lowText = "-180°", highText = "180°", snap = 5,
+    x = 24, y = -142, low = -180, high = 180, lowText = "-180°", highText = "180°", snap = 5,
     text = function(value)
         if value == 0 then
-            return "Screen rotation: none (north is up)"
+            return "Rotation: none (north is up)"
         end
-        return format("Screen rotation: %d°", value)
+        return format("Rotation: %d°", value)
     end,
     tooltip = "Turns the whole view. At 0, north is at the top of the screen, as on the minimap.",
     apply = applyCamera,
@@ -159,36 +165,36 @@ makeSlider("camYaw", {
 -- Buildings
 ---------------------------------------------------------------------------
 
-heading("Buildings and caves", -250)
+heading("Buildings and caves", -180)
 
 makeCheck("cutaway", {
-    y = -268, label = "Hide roofs and upper floors indoors",
-    tooltip = "Indoors, nothing above your character's head is drawn, so you look into the room from above. "
-        .. "Clicks go straight through what is hidden.",
+    y = -196, label = "Indoors, show only the inside of the building",
+    tooltip = "Under a roof you look into the rooms from above: the roof and the walls on the camera's side "
+        .. "are left out, and so is everything outdoors, which goes black. Clicks go through what is left out.",
     apply = applyCutaway,
 })
 
 makeSlider("cutawayHeight", {
-    x = 52, y = -316, width = 232, low = 2, high = 15, lowText = "Low walls", highText = "High walls",
-    text = function(value) return format("Wall height indoors: %d yd", value) end,
-    tooltip = "How much of the walls is left standing. Lower shows more of the floor behind them. Higher keeps "
-        .. "more of the walls, and of creatures taller than the cut. Under a low ceiling the cut is made "
-        .. "just below the ceiling; in a tall room, just below whatever is in the way.",
+    x = 48, y = -240, width = 200, low = 2, high = 15, lowText = "Low walls", highText = "Full height",
+    text = function(value) return format("Wall height: %d yd", value) end,
+    tooltip = "Indoors, whatever is higher than this above your character's feet is cut away: beams, the "
+        .. "floor upstairs, the tops of the walls. Low gives the clearest view. All the way up, walls stand "
+        .. "to the ceiling. Under a lower ceiling the cut is made just below the ceiling.",
     apply = applyCutaway,
 })
 
 makeCheck("cutawayOutdoors", {
-    x = 44, y = -350, label = "Outdoors too, when a building hides your character",
-    tooltip = "When an archway, bridge or building comes between the camera and your character, it is cut "
-        .. "away just far enough to see past it. The same in halls taller than the camera. Trees and rocks "
-        .. "are left alone.",
+    y = -274, label = "Outdoors, slice the world when a building hides you",
+    tooltip = "When an archway or a building comes between the camera and your character outdoors, everything "
+        .. "above it is cut away, all over the screen. Rough: other buildings are sliced open too, and many "
+        .. "of them are hollow.",
     apply = applyCutaway,
 })
 
 makeCheck("indoorCollision", {
-    y = -380, label = "Otherwise, move the camera in indoors",
-    tooltip = "Without the cutaway: indoors the camera comes closer whenever a wall or ceiling is in the way, "
-        .. "so you see your character instead of the roof.",
+    y = -299, label = "Otherwise, move the camera in indoors",
+    tooltip = "Without the inside view: indoors the camera comes closer whenever a wall or ceiling is in the "
+        .. "way, so you see your character instead of the roof.",
     apply = applyCamera,
 })
 
@@ -196,17 +202,17 @@ makeCheck("indoorCollision", {
 -- Clicks and sound
 ---------------------------------------------------------------------------
 
-heading("Clicks and sound", -416)
+heading("Clicks and sound", -332)
 
 makeCheck("groundClicks", {
-    y = -434, label = "Roof clicks walk to the ground below",
+    y = -348, label = "Roof clicks walk to the ground below",
     tooltip = "A move click that lands on a roof or a treetop takes your character to the ground under the "
         .. "cursor instead.",
     apply = function() ns:ApplyGroundClicks() end,
 })
 
 makeCheck("soundAtCamera", {
-    y = -462, label = "Sound follows the screen",
+    y = -373, label = "Sound follows the screen",
     tooltip = "Something on the right of the screen is heard on the right. Off: sound is heard from where "
         .. "your character stands and faces, as the game normally does it.",
     apply = function() if ns.db.enabled then ns:ApplyCVars() end end,
@@ -253,16 +259,17 @@ local function refresh()
     setSliderEnabled(sliders.camPitch, camera)
     setSliderEnabled(sliders.camDistance, camera)
     setSliderEnabled(sliders.camYaw, camera)
-    setCheckEnabled(checks.cutaway, cutaway, "Needs the client library, version 0.3.0 or later.")
+    setCheckEnabled(checks.cutaway, cutaway, "Needs the client library, version 0.4.0 or later.")
     setSliderEnabled(sliders.cutawayHeight, cutaway and db.cutaway)
     setCheckEnabled(checks.cutawayOutdoors, cutaway and db.cutaway)
     setCheckEnabled(checks.indoorCollision, camera and not (cutaway and db.cutaway), camera
-        and "Not needed while roofs are hidden." or "Needs the client library.")
+        and "Not needed while the inside view is on." or "Needs the client library.")
     setCheckEnabled(checks.groundClicks, ns:ClientCanGroundClick(), "Needs the client library.")
 
     if not ns:HasClient() then
-        note:SetText("Most of these need the client library (WotLK-ARPG.dll), which is not loaded. Without it, "
-            .. "set the camera up with /arpg camedit and /arpg savecam.")
+        -- Two lines is all the room there is: about 140 characters.
+        note:SetText("The client library (WotLK-ARPG.dll) is not loaded, and most of this needs it. "
+            .. "Meanwhile: /arpg camedit, /arpg savecam.")
     elseif db.enabled then
         note:SetText("The mode is on. Everything here takes effect as you change it.")
     else

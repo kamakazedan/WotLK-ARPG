@@ -4,9 +4,12 @@
     Core.lua: saved variables, the mode switch, events and the /arpg command.
     Camera.lua, Input.lua and Options.lua add the pieces the switch drives.
 
-    Everything the mode changes is reversible: CVars are snapshotted and put
-    back, and every key or mouse change is an override binding that vanishes
-    when the mode is turned off. The saved key bindings are never touched.
+    Nothing the mode changes outlasts it. The client's settings (CVars) are
+    the mode's only while a session lasts: the player's own go back when the
+    mode is turned off and whenever the UI shuts down, before the client
+    saves them, so no other client the account logs in from ever sees the
+    mode's. Every key or mouse change is an override binding that vanishes
+    with the mode. The saved key bindings are never touched.
 
     The addon works alone on a stock client. With the client library
     (WotLK-ARPG.dll, see client/ in the repository) it also gets hold-to-move,
@@ -34,19 +37,19 @@ local defaults = {
     camYaw = 0,             -- degrees; 0 looks north, so north is up on screen
     camPitch = 60,          -- degrees above the horizon the camera looks down from
     camDistance = 22,       -- yards from the character
-    cutaway = true,         -- indoors, leave out whatever is above the character's head
-    cutawayHeight = 4,      -- yards above the character's feet at which the world is cut indoors
-    cutawayOutdoors = true, -- elsewhere, also cut a building that stands between the camera and the character
-    indoorCollision = true, -- without the cutaway: indoors, let the camera move in when a wall is in the way
+    cutaway = true,         -- indoors, show only the inside of the building, looked into from above
+    cutawayHeight = 4,      -- yards above the character's feet at which that view is cut off
+    cutawayOutdoors = false, -- outdoors, slice the world while a building hides the character (rough)
+    indoorCollision = true, -- without the inside view: indoors, let the camera move in when a wall is in the way
     groundClicks = true,    -- move clicks on roofs and treetops go to the ground under the cursor
     groundClickHeight = 3,  -- yards above the character's feet that still count as somewhere to walk
     soundAtCamera = true,   -- hear the world from the camera, so left and right match the screen
 }
 ns.defaults = defaults
 
--- Kept per character (WotLKARPGCharDB), because the client keeps the things
--- they describe per character: the CVars to put back when the mode goes off
--- (savedCVars), and whether the camera view slot holds the ARPG camera.
+-- Kept per character (WotLKARPGCharDB), because the client keeps the thing
+-- it describes per character: whether the camera view slot holds the ARPG
+-- camera. (Up to 0.3.0 also savedCVars: see AdoptSavedCVars in Camera.lua.)
 local characterDefaults = {
     hasView = false,
 }
@@ -63,7 +66,8 @@ end
 ns.FEATURE_HOLD_MOVE = 2
 ns.FEATURE_CAMERA_ANGLES = 4
 ns.FEATURE_CAMERA_DISTANCE = 8
-ns.FEATURE_CUTAWAY = 16
+ns.FEATURE_CUTAWAY = 16     -- up to library 0.3.0 this alone: the world cut open, outdoors and all
+ns.FEATURE_INSIDE_VIEW = 32 -- from 0.4.0: buildings shown from inside
 
 function ns:HasClient()
     return type(ARPG_ClientVersion) == "function"
@@ -123,25 +127,24 @@ function ns:ApplyGroundClicks()
     end
 end
 
--- The cutaway: indoors, the library leaves out everything above the
--- character's head and draws the rooms below. The library decides frame by
--- frame whether there is anything to cut; this only says whether it may.
+-- The inside view (the "cutaway" of the settings and of the library's
+-- function names): while the character is in a building, the library shows
+-- the building from inside, looked into from above, with nothing of the
+-- outdoor world, and cuts off whatever is higher than a set height. The
+-- library decides frame by frame what there is to do; this only says whether
+-- it may.
 function ns:ClientCanCutAway()
-    return self:ClientHas(self.FEATURE_CUTAWAY)
+    return self:ClientHas(self.FEATURE_INSIDE_VIEW)
 end
 
 function ns:CutawayWanted()
     return (self.db.enabled and self.db.cutaway and not self.cameraEdit) and true or false
 end
 
--- True while the cutaway is doing the job indoors, so the camera has no need
--- to collide with anything. False too if the library has given up on it
--- (its tenth value: the renderer does not take the changed projection).
+-- True while the inside view is doing the job indoors, so the camera has no
+-- need to collide with anything.
 function ns:CutawayWorks()
-    if not (self:CutawayWanted() and self:ClientCanCutAway()) then
-        return false
-    end
-    return select(10, ARPG_CutawayInfo()) ~= 1
+    return self:CutawayWanted() and self:ClientCanCutAway()
 end
 
 function ns:ApplyCutaway()
@@ -227,6 +230,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
 end)
 frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_LOGIN")
+frame:RegisterEvent("PLAYER_LOGOUT")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 frame:RegisterEvent("UPDATE_BINDINGS")
@@ -270,6 +274,13 @@ function ns:ADDON_LOADED(name)
             account[key] = value
         end
     end
+    -- 0.4.0 shows buildings from inside. Slicing the world outdoors, which
+    -- was on by default before and leaves hollow buildings standing about,
+    -- is now something to ask for.
+    if (account.revision or 1) < 2 then
+        account.cutawayOutdoors = false
+        account.revision = 2
+    end
     for key, value in pairs(characterDefaults) do
         if char[key] == nil then
             char[key] = value
@@ -277,11 +288,28 @@ function ns:ADDON_LOADED(name)
     end
     WotLKARPGDB, WotLKARPGCharDB = account, char
     self.db, self.char = account, char
+
+    -- A snapshot of the player's own CVars from 0.3.0 or before: looked at
+    -- at login, when the client has loaded the account's settings.
+    self.legacyCVars, char.savedCVars = char.savedCVars, nil
 end
 
 function ns:PLAYER_LOGIN()
     self.ready = true
+    if self.legacyCVars then
+        self:AdoptSavedCVars(self.legacyCVars)
+        self.legacyCVars = nil
+    end
     self:Sync(true)
+end
+
+-- Logging out, exiting, reloading the UI. The client is about to save its
+-- settings, the account's to the server as well: it writes them right after
+-- this event (0x00528F00 raises it at 0x00529025 and writes the settings
+-- caches from 0x0052908E on, and nowhere else). So it gets the player's own.
+-- The mode stays on; the next login applies its values again.
+function ns:PLAYER_LOGOUT()
+    self:RestoreCVars()
 end
 
 -- Loading screens can move the camera; put the saved view back.
@@ -361,51 +389,51 @@ function ns:PrintCameraProof()
     end
 end
 
--- The same for the cutaway: what the library is doing with it right now.
+-- The same for the inside view: what the library is doing right now, and
+-- what it found around the character that made it decide so.
 function ns:PrintCutawayProof()
     local db = self.db
     local fallback = db.indoorCollision and "the camera moves in when a wall is in the way" or "the camera stays put"
     if not self:ClientCanCutAway() then
-        ns.Print(format("Indoors: %s. (No cutaway: it needs client library 0.3.0 or later with all its hooks in.)",
-            fallback))
+        ns.Print(format("Indoors: %s. (No inside view: it needs client library 0.4.0 or later with all its "
+            .. "hooks in.)", fallback))
         return
     end
     if not db.cutaway then
-        ns.Print(format("Indoors: %s. The cutaway is switched off.", fallback))
+        ns.Print(format("Indoors: %s. The inside view is switched off.", fallback))
         return
     end
-    local asked, cutting, height, frames, cut, skipped, rooms, indoors, _, refused, overhead, between =
-        ARPG_CutawayInfo()
+    local asked, cutting, height, frames, cut, skipped, rooms, indoors, _, refused, overhead, between, inside,
+        insideFrames = ARPG_CutawayInfo()
     if asked ~= 1 then
-        ns.Print("Cutaway: not in use at the moment.")
+        ns.Print("Inside view: not in use at the moment.")
         return
     end
-    -- What the library found around the character: this decides the cut.
-    local view = (between or 0) > 0 and format("line of sight blocked %.1f yd up", between) or "line of sight clear"
-    local where
-    if indoors == 1 then
-        where = format("indoors, %s, %s", (overhead or 0) > 0 and format("ceiling %.1f yd up", overhead)
-            or "no ceiling found", view)
+    local ceiling = (overhead or 0) > 0 and format("ceiling %.1f yd up", overhead) or "no ceiling found"
+    local cutText = cutting == 1 and format("cut %.1f yd above your feet", height) or "nothing cut"
+    if inside == 1 then
+        ns.Print(format("Inside view: %d room%s shown from inside, %s, %s.", rooms, rooms == 1 and "" or "s",
+            ceiling, cutText))
+    elseif indoors == 1 then
+        -- The client says the character is indoors, but its own lookup of
+        -- the room under the character came back empty.
+        ns.Print(format("|cffffd200Inside view: this building is not found from inside|r, so the world is "
+            .. "drawn, sliced open (%s, %s, %s, %d rooms).", ceiling, (between or 0) > 0
+            and format("line of sight blocked %.1f yd up", between) or "line of sight clear", cutText, rooms))
+    elseif cutting == 1 then
+        ns.Print(format("Outdoors: a building hides you %.1f yd up; the world is %s.", between or 0, cutText))
     else
-        where = "outdoors, " .. view
+        ns.Print("Inside view: on. You are outdoors, and nothing is cut.")
     end
     if refused == 1 then
-        ns.Print("|cffff2020Cutaway: the game's renderer does not take it|r (it needs Direct3D 9). Indoors "
-            .. fallback .. " instead. Please send WotLK-ARPG.log.")
-    elseif cutting == 1 then
-        ns.Print(format("Cutaway: cutting %.1f yd above your feet (%s), %d rooms shown.", height, where, rooms))
-    else
-        ns.Print(format("Cutaway: on, nothing to cut right now (%s).", where))
+        ns.Print("|cffff2020The game's renderer does not take the cut|r (it needs Direct3D 9): beams and the "
+            .. "floor upstairs stay in the picture. Please send WotLK-ARPG.log.")
+    elseif skipped > 0 and cut == 0 then
+        ns.Print(format("|cffff2020The cut is asked for but is not taking effect|r (%d frames, %d skipped). "
+            .. "Please send this line and WotLK-ARPG.log.", frames, skipped))
     end
-    if refused ~= 1 then
-        if skipped > 0 and cut == 0 then
-            ns.Print(format("|cffff2020The cutaway is asked for but is not taking effect|r (%d frames, %d skipped). "
-                .. "Please send this line and WotLK-ARPG.log.", frames, skipped))
-        else
-            ns.Print(format("  Drawn cut in %d of %d frames since the UI loaded%s.", cut, frames,
-                skipped > 0 and format(" (%d skipped)", skipped) or ""))
-        end
-    end
+    ns.Print(format("  Since the UI loaded: %d frames, %d drawn from inside a building, %d cut%s.", frames,
+        insideFrames or 0, cut, skipped > 0 and format(" (%d skipped)", skipped) or ""))
 end
 
 function ns:PrintHelp()
@@ -413,7 +441,7 @@ function ns:PrintHelp()
     ns.Print("  /arpg - turn the mode on or off (also: /arpg on, /arpg off)")
     ns.Print("  /arpg wasd - lock or unlock WASD movement (in combat use the key binding)")
     ns.Print("  /arpg options - all settings (also: /arpg angle 60, /arpg distance 22, /arpg rotation 0)")
-    ns.Print("  /arpg cut - roofs off indoors, on or off (/arpg cut 4: wall height; /arpg cut outdoors: outdoors too, on or off)")
+    ns.Print("  /arpg cut - buildings shown from inside, on or off (/arpg cut 4: wall height; /arpg cut outdoors: slice the world outdoors too)")
     ns.Print("  /arpg ground - roof and treetop clicks go to the ground, on or off (/arpg ground 3 sets the height)")
     ns.Print("  /arpg sound - hear the world from the camera or from the character")
     ns.Print("  /arpg camedit - free the camera, mouse and scroll wheel for a look around")
@@ -491,13 +519,14 @@ function ns:SetCutaway(text)
     self:ApplyCutaway()
     self:ApplyClientCamera()
     if db.cutaway then
-        ns.Print(format("Cutaway on: indoors, what is more than %d yards above your feet is left out%s.",
-            db.cutawayHeight, db.cutawayOutdoors and "; outdoors, so is a building that hides your character" or ""))
+        ns.Print(format("Inside view on: under a roof you see only the inside of the building, up to %d yards "
+            .. "above your feet.%s", db.cutawayHeight, db.cutawayOutdoors
+            and " Outdoors, the world is sliced while a building hides your character." or ""))
     else
-        ns.Print("Cutaway off: buildings are drawn whole.")
+        ns.Print("Inside view off: buildings are drawn whole.")
     end
     if not self:ClientCanCutAway() then
-        ns.Print("This needs the client library (0.3.0 or later), which is not loaded.")
+        ns.Print("This needs the client library (0.4.0 or later), which is not loaded.")
     elseif not db.enabled then
         ns.Print("It takes effect while the mode is on (/arpg).")
     end

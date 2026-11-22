@@ -31,16 +31,18 @@ no need to run the Install script again.
 In game
 -------
   /arpg            turn the mode on or off
-  /arpg options    camera, roofs, clicks and sound
-  /arpg cut        roofs off indoors, on or off
+  /arpg options    camera, buildings, clicks and sound
+  /arpg cut        buildings shown from inside, on or off
   /arpg status     what is on, and whether the library is working
   /arpg help       everything else
 
 Hold the left mouse button to move. Click a creature, object or corpse to walk
-up and interact, attack or loot. Indoors the roof and the upper floors are
-left out, so you look into the room from above.
+up and interact, attack or loot. Indoors you see the building from inside,
+looked into from above, and nothing of the world outside.
 
-Nothing here uses or changes any other addon.
+Nothing here uses or changes any other addon. The game's own settings that
+the mode changes while you play (camera following, click-to-move and so on)
+are put back every time you log out, so your other clients never see them.
 
 If something is off
 -------------------
