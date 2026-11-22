@@ -1,9 +1,9 @@
 # WotLK-ARPG
 
 Diablo-style play for a World of Warcraft 3.3.5a (build 12340) client: a fixed
-top-down camera that faces north, hold the left mouse button to move, roofs
-that come off when you walk indoors, and WASD switched off unless you turn it
-on. Built for a privately run server.
+top-down camera that faces north, hold the left mouse button to move,
+buildings you look into from above once you walk inside, and WASD switched
+off unless you turn it on. Built for a privately run server.
 
 It comes in two parts:
 
@@ -11,10 +11,13 @@ It comes in two parts:
   controls. On its own it gives click-to-move and a parked camera.
 - **The client library** (`WotLK-ARPG.dll`, loaded by `Wow.exe`) does what an
   addon is not allowed to: hold-to-move, a camera that cannot be turned,
-  zoomed or pushed around by walls, and buildings drawn with their roofs off.
+  zoomed or pushed around by walls, and buildings shown from inside.
 
 It stands alone. It does not use, need or change any other addon, so the rest
-of your addons behave as they always do, with the mode on or off.
+of your addons behave as they always do, with the mode on or off. And it
+leaves nothing behind in the game's own settings: what it changes while you
+play is put back before the game saves anything, so another client you log
+in from, with or without this addon, finds your settings as you left them.
 
 | Feature | Needs | Status |
 |---|---|---|
@@ -26,7 +29,10 @@ of your addons behave as they always do, with the mode on or off.
 | Clicks on roofs and treetops move to the ground under the cursor | client library | works in game |
 | Sound heard from the camera, so left and right match the screen | addon | done |
 | Settings panel; settings shared by every character | addon | done |
-| Roofs and upper floors hidden while the character is indoors, or behind a building | client library | new in 0.3.0, not yet proven in game |
+| The game's own settings as you left them on every other client | addon | fixed in 0.4.0 |
+| Indoors, the building shown from inside, looked into from above, on black | client library | new in 0.4.0, not yet proven in game |
+| Indoors, walls, beams and upper floors cut off at a set height | client library | works in game |
+| Outdoors, the world sliced open when a building hides the character | client library | rough; off unless asked for |
 | A skill on the left mouse button (and the right, with WASD on): walk into range, then cast | addon + client library | next |
 | Bigger minimap; click it to walk there | addon + client library | planned |
 | World map in a window; click a place to travel there | addon + server pathing | planned |
@@ -68,11 +74,11 @@ Addon only, no client changes: copy `addon/WotLK-ARPG` into `Interface/AddOns/`.
 | `/arpg angle 60` | How steeply the camera looks down, 10 to 89 degrees |
 | `/arpg distance 22` | How far the camera is from the character, 5 to 100 yards |
 | `/arpg rotation 0` | Turns the whole view; 0 keeps north at the top |
-| `/arpg cut` | Roofs off indoors, on or off; `/arpg cut 4` sets how many yards of wall are left standing; `/arpg cut outdoors` switches the outdoor part |
+| `/arpg cut` | Buildings shown from inside, on or off; `/arpg cut 4` sets how many yards of wall are left standing; `/arpg cut outdoors` switches the slicing outdoors |
 | `/arpg ground` | Roof and treetop clicks go to the ground under the cursor, on or off; `/arpg ground 3` sets from how many yards up |
 | `/arpg sound` | Hear the world from the camera or from the character |
 | `/arpg camedit` | Free the camera, mouse and scroll wheel for a look around |
-| `/arpg status` | Show what is on, and whether the camera lock and the cutaway are really in effect |
+| `/arpg status` | Show what is on, and whether the camera lock and the inside view are really in effect |
 
 Keys for the mode and for the WASD toggle are under **Key Bindings > WotLK-ARPG**.
 Bind the WASD toggle there: it is the one that works in combat.
@@ -95,16 +101,22 @@ While the mode is on:
   as far away as the camera is; `/arpg sound` switches back.
 - **Camera**: stays where the settings put it, 22 yards out at 60 degrees
   unless you change it, and goes through walls instead of zooming in.
-- **Indoors** nothing more than 4 yards above your character's feet is drawn:
-  roofs, upper floors and the tops of the walls are gone, and you look into
-  the room from above. Click and hover go straight through what is hidden.
-  Upstairs, the cut goes up with you. Under a ceiling lower than 4 yards the
-  cut is made just below the ceiling, and in a tall room just below whatever
-  is in the way, so a great hall keeps its walls. A hall with a roof higher
-  than the camera is left whole.
-- **Outdoors** the same cut is made, just far enough, when part of a building
-  (an archway, a bridge, a house you walk behind) comes between the camera
-  and your character. Trees, rocks and hills do not trigger it.
+- **Indoors** you see the building from inside and nothing else. The roof
+  and the walls on the camera's side are left out, so you look into the
+  rooms from above; the street, the hills and the sky are not drawn at all,
+  and the screen is black where the building ends. Rooms that open off the
+  one you are in are shown too. Whatever is more than 4 yards above your
+  feet is cut away: beams, galleries, the floor upstairs and the tops of the
+  walls. Under a ceiling lower than that the cut is made just below the
+  ceiling, and a tall room keeps its walls up to its ceiling. Clicks and
+  hover go through everything that is left out. Upstairs, the cut goes up
+  with you.
+- **Outdoors** nothing changes, unless you ask for it: with "Outdoors, slice
+  the world when a building hides you" ticked, everything above the part of
+  a building that stands between the camera and your character is cut away,
+  all over the screen. It keeps the character in view under an archway or
+  behind a house. It is rough: other buildings are sliced open too, and many
+  of them are hollow.
 - **Scroll wheel and right mouse button**: do nothing, for now.
 
 In the options, drag a slider or roll the mouse wheel over it for single
@@ -112,29 +124,42 @@ steps; right-click puts it back to its default.
 
 The settings are shared by every character on the account, and the mode is on
 when you log in unless you switched it off. Turning it off puts everything
-back. The addon never changes your saved key bindings, and it restores every
-setting it touched.
+back. The addon never changes your saved key bindings.
+
+### Your other clients
+
+The game keeps some settings per account (camera following style, maximum
+camera distance, follow terrain, click-to-move) and stores them on the server,
+so that they follow you to any client you log in from. The mode needs six of
+them set its own way while it is on. It puts your own values back whenever
+you log out, exit or reload the UI, before the game saves them, and applies
+its own again when you log in. Up to 0.3.0 it did not, and the mode's values
+turned up on every other client of the account. Logging out once with 0.4.0,
+on the character you first used the mode with, puts your old values back;
+or set them once by hand on the other client (Interface > Camera, and
+Click-to-Move under Mouse), and from then on they stay.
 
 Without the client library the addon still works: one click per move,
 `/arpg camedit` and `/arpg savecam` to set the camera up by hand.
 
-### What the cutaway cannot do yet
+### What the inside view cannot do yet
 
-It cuts the whole picture at one level, like a knife through a model. So:
-
-- Anything taller than the cut loses its top while a cut is on: a giant in
-  the room, a tree by the house, the hillside behind it. Raise the wall
-  height if that bothers you more than walls do.
-- Standing right behind a wall, your character's legs are hidden by what is
-  left of it.
-- Where nothing is left to draw you see the plain background colour.
-- It needs the Direct3D 9 renderer (the default, and the one DXVK works
-  through). If the renderer does not take it, the library says so in
-  `/arpg status`, gives up, and the camera moves in indoors instead, as it
-  did in 0.2.
-- Expected, not yet seen: fog added by other mods (CoAVolFog) may look
-  thinner while a cut is on, and the name of a creature on a hidden floor
-  may still show.
+- A building is shown from inside wherever the game itself can tell which
+  room your character stands in. Where it cannot (`/arpg status` says "this
+  building is not found from inside"), the world is drawn as usual and sliced
+  open at the wall height instead, as 0.3.0 did everywhere.
+- Rooms on the camera's side of the one you are in are not shown: they would
+  be in the way.
+- The cut is level and takes everything above it: a creature taller than
+  the wall height loses its top. Raise the wall height, or set it all the way
+  up for walls to the ceiling.
+- A wall inside the room that stands between the camera and your character
+  hides what is behind it, up to the wall height.
+- The cut needs the Direct3D 9 renderer (the default, and the one DXVK works
+  through). Without it the building is still shown from inside, but beams
+  and the floor upstairs stay in the picture.
+- Expected, not yet seen: the name of a creature out in the street may still
+  show over the black.
 
 `/arpg cut off` switches it all off, and the "Otherwise, move the camera in
 indoors" option then decides what happens under a roof.
@@ -143,8 +168,9 @@ indoors" option then decides what happens under a roof.
 
 - `/arpg status` says whether the library loaded, which parts are working, in
   how many of the client's camera updates the lock was actually applied, and
-  what the cutaway is doing right now and why: whether it found a ceiling, at
-  what height, and how many frames it has drawn cut.
+  what the inside view is doing right now and why: how many rooms it shows,
+  whether it found a ceiling and at what height, where it cuts, and how many
+  frames it has drawn from inside a building.
 - `WotLK-ARPG.log`, next to `Wow.exe`, is written at every start. It lists each
   place the library patched, or why it left one alone.
 - The library refuses to touch a client it does not recognise: every patch
@@ -169,14 +195,15 @@ indoors" option then decides what happens under a roof.
 ```
 client/build.sh       # build/WotLK-ARPG.dll and build/mock-client.exe (clang, lld; any OS)
 client/test/run.sh    # hook engine test, then the library against a mock client (Linux)
-python3 client/test/mutation_test.py            # breaks the cutaway 38 ways; the tests must notice each
+python3 client/test/mutation_test.py            # breaks the cutaway 64 ways; the tests must notice each
 python3 client/test/installer_test.py           # the setup script, on a made-up Wow.exe
 python3 client/tools/verify_sites.py Wow.exe    # your own Wow.exe against the patch sites
 tools/package.sh      # dist/WotLK-ARPG/: what gets installed
 ```
 
-CI runs all of it on every push, and runs the real DLL and the setup script on
-Windows. [docs/DESIGN.md](docs/DESIGN.md) explains how the pieces work.
+CI runs all of it but the mutation test on every push, and runs the real DLL
+and the setup script on Windows. [docs/DESIGN.md](docs/DESIGN.md) explains
+how the pieces work.
 
 ## Layout
 
