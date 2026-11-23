@@ -30,11 +30,13 @@ in from, with or without this addon, finds your settings as you left them.
 | Sound heard from the camera, so left and right match the screen | addon | done |
 | Settings panel; settings shared by every character | addon | done |
 | The game's own settings as you left them on every other client | addon | fixed in 0.4.0 |
-| Indoors, the building shown from inside, looked into from above, on black | client library | reworked in 0.5.0 after its first test in game; not yet proven |
-| Indoors, walls, beams and upper floors cut off at a set height | client library | worked in game up to 0.4.0; done another way in 0.5.0, not yet proven |
-| Outdoors, the world sliced open when a building hides the character | client library | rough; off unless asked for |
+| Indoors, the building shown from inside, looked into from above | client library | works in game since 0.5.0; with a fog mod the background comes out grey, not black |
+| Indoors, walls, beams and upper floors cut off at a set height | client library | works in game |
+| Indoors, scenery and creatures that stand outside the rooms left out | client library | new in 0.6.0; not yet run in game |
+| Outdoors, the building that hides the character cut open, and nothing else | client library | new in 0.6.0 (before: the whole screen); not yet run in game; off unless asked for |
 | A skill on the left mouse button (and the right, with WASD on): walk into range, then cast | addon + client library | next |
 | Bigger minimap; click it to walk there | addon + client library | planned |
+| Walking around obstacles, up ramps and down stairs to where you clicked | client library + server pathing | planned |
 | World map in a window; click a place to travel there | addon + server pathing | planned |
 | Health and resource orbs | addon | planned |
 | Casting while moving, dodge | server + Spell.dbc | planned |
@@ -74,7 +76,7 @@ Addon only, no client changes: copy `addon/WotLK-ARPG` into `Interface/AddOns/`.
 | `/arpg angle 60` | How steeply the camera looks down, 10 to 89 degrees |
 | `/arpg distance 22` | How far the camera is from the character, 5 to 100 yards |
 | `/arpg rotation 0` | Turns the whole view; 0 keeps north at the top |
-| `/arpg cut` | Buildings shown from inside, on or off; `/arpg cut 4` sets how many yards of wall are left standing; `/arpg cut outdoors` switches the slicing outdoors |
+| `/arpg cut` | Buildings shown from inside, on or off; `/arpg cut 4` sets how many yards of wall are left standing; `/arpg cut outdoors` switches the opening up of buildings outdoors |
 | `/arpg ground` | Roof and treetop clicks go to the ground under the cursor, on or off; `/arpg ground 3` sets from how many yards up |
 | `/arpg sound` | Hear the world from the camera or from the character |
 | `/arpg camedit` | Free the camera, mouse and scroll wheel for a look around |
@@ -110,18 +112,25 @@ While the mode is on:
   upstairs and the tops of the walls. Under a ceiling lower than that the
   cut is made just below the ceiling, and a tall room keeps its walls up to
   its ceiling. Clicks and hover go through everything that is left out.
-  Upstairs, the cut goes up with you.
+  Upstairs, the cut goes up with you. The lamp outside the door, the
+  planter under the window and whoever walks by in the street are not drawn
+  either, although the game counts them to the room; only what is within
+  8 yards of your character always is, so that nobody who can hit you is
+  invisible for standing on the doorstep.
 - **What counts as indoors** is the game's own answer, the one that decides
   where you may ride. A city's streets, squares and bridges are outdoors,
   although the game builds many of them as part of the same model as the
   houses; so are most porches and gateways. You step from one picture into
   the other at the door.
-- **Outdoors** nothing changes, unless you ask for it: with "Outdoors, slice
-  the world when a building hides you" ticked, everything above the part of
-  a building that stands between the camera and your character is cut away,
-  all over the screen. It keeps the character in view under an archway, a
-  porch roof or behind a house. It is rough: other buildings are sliced open
-  too, and many of them are hollow.
+- **Outdoors** nothing changes, unless you ask for it: with "Outdoors, open
+  up the building that hides you" ticked, a roof, an archway or a wall that
+  comes between the camera and your character is cut away just under where
+  it hides you. Only the parts of the building that are in the way are cut,
+  with the rooms inside them; the signs, lanterns and chimneys that sit on
+  those parts above the cut are left out with them. Other buildings, the
+  street, the terrain and the trees stay whole. It keeps the character in
+  view under an archway or a porch roof and behind a house. A part goes
+  back to whole a second after it stops being in the way.
 - **Scroll wheel and right mouse button**: do nothing, for now.
 
 In the options, drag a slider or roll the mouse wheel over it for single
@@ -151,8 +160,19 @@ Without the client library the addon still works: one click per move,
 
 - The picture changes at the door, at once: there is no fade yet.
 - Under a porch roof or an archway that the game counts as outdoors you are
-  outdoors, and the roof is drawn. The "Outdoors, slice the world" option is
-  the only help there so far.
+  outdoors, and the roof is drawn unless "Outdoors, open up the building
+  that hides you" is ticked.
+- Outdoors a building is cut open in whole parts, as the game's files divide
+  it: a terrace of houses built as one part opens along its whole length.
+  A part comes back all at once, a second after it was last in the way.
+  Scenery on it is all or nothing: the game draws many copies of one model
+  in a single go, so one of them cannot be cut. What sits wholly above the
+  cut disappears; a banner that hangs from above the cut to below it stays,
+  in the air. And where the library cannot tell which part hides you, it
+  cuts everything on screen, as it did before 0.6.0; `/arpg status` says
+  which it is doing.
+- A creature or an object within 8 yards of your character is drawn wherever
+  it stands, also outside the wall. That includes a mailbox by the door.
 - Where the game has you indoors but cannot tell which room you stand in
   (`/arpg status` says "this building is not found from inside"), the world
   is drawn as usual and sliced open at the wall height instead, as 0.3.0 did
@@ -166,10 +186,10 @@ Without the client library the addon still works: one click per move,
   DXVK is one). With OpenGL the building is still shown from inside, but
   beams and the floor upstairs stay in the picture.
 - With a fog mod that fogs the finished picture by depth, the black behind
-  the rooms takes on as much fog as the far end of the rooms themselves:
-  next to nothing in a house, a tint in a great hall. With CoAVolFog,
-  `InteriorDensity=0` in `CoAVolFog.ini` should take the rest away (going
-  by that file's own notes; not tried).
+  the rooms is fogged like a wall at the far end of the rooms. With
+  CoAVolFog that comes out a flat grey in the one picture seen so far.
+  `InteriorDensity=0` in `CoAVolFog.ini` should take it away (going by that
+  file's own notes; not tried).
 - Expected, not yet seen: the name of a creature out in the street may still
   show over the black.
 
@@ -182,10 +202,11 @@ indoors" option then decides what happens under a roof.
   how many of the client's camera updates the lock was actually applied, and
   what the inside view is doing right now and why: how many rooms it shows,
   whether it found a ceiling and at what height, where it cuts, how many
-  frames it has drawn from inside a building, and what the game has under
-  your feet (which part of which kind of building, and whether that counts
-  as indoors). If a place shows the wrong picture, that last line is the one
-  to send.
+  frames it has drawn from inside a building, how much it left out for
+  standing outside the rooms, how many parts of a building it is cutting
+  outdoors, and what the game has under your feet (which part of which kind
+  of building, and whether that counts as indoors). If a place shows the
+  wrong picture, a screenshot with those lines on it says why.
 - `WotLK-ARPG.log`, next to `Wow.exe`, is written at every start. It lists each
   place the library patched, or why it left one alone.
 - The library refuses to touch a client it does not recognise: every patch
@@ -206,7 +227,7 @@ indoors" option then decides what happens under a roof.
   the log.
 - **CoAVolFog** in particular: none of the places it checks or patches in
   `Wow.exe` is touched (0.4.0 patched the client's fog routine, which
-  CoAVolFog patches too; 0.5.0 leaves it alone). The cut no longer changes
+  CoAVolFog patches too; later versions leave it alone). The cut no longer changes
   the depth the game draws with, which that mod's fog and water read. And
   the plane the cut uses is switched off before the sun's glare, floating
   text, names and the mod's own passes are drawn.
@@ -216,7 +237,7 @@ indoors" option then decides what happens under a roof.
 ```
 client/build.sh       # build/WotLK-ARPG.dll and build/mock-client.exe (clang, lld; any OS)
 client/test/run.sh    # hook engine test, then the library against a mock client (Linux)
-python3 client/test/mutation_test.py            # breaks the cutaway 115 ways; the tests must notice each
+python3 client/test/mutation_test.py            # breaks the cutaway 192 ways; the tests must notice each
 python3 client/test/installer_test.py           # the setup script, on a made-up Wow.exe
 python3 client/tools/verify_sites.py Wow.exe    # your own Wow.exe against the patch sites
 tools/package.sh      # dist/WotLK-ARPG/: what gets installed
