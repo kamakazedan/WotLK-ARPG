@@ -39,7 +39,7 @@ local defaults = {
     camDistance = 22,       -- yards from the character
     cutaway = true,         -- indoors, show only the inside of the building, looked into from above
     cutawayHeight = 4,      -- yards above the character's feet at which that view is cut off
-    cutawayOutdoors = false, -- outdoors, slice the world while a building hides the character (rough)
+    cutawayOutdoors = false, -- outdoors, cut open the parts of a building that hide the character
     indoorCollision = true, -- without the inside view: indoors, let the camera move in when a wall is in the way
     groundClicks = true,    -- move clicks on roofs and treetops go to the ground under the cursor
     groundClickHeight = 3,  -- yards above the character's feet that still count as somewhere to walk
@@ -404,8 +404,10 @@ function ns:PrintCutawayProof()
         ns.Print(format("Indoors: %s. The inside view is switched off.", fallback))
         return
     end
+    -- The last five are nil with a library older than 0.6.0.
     local asked, cutting, height, frames, cut, skipped, rooms, indoors, _, refused, overhead, between, inside,
-        insideFrames, draws, group, groupFlags, area, doorsOut = ARPG_CutawayInfo()
+        insideFrames, draws, group, groupFlags, area, doorsOut, parts, sceneryOut, creaturesOut, canChoose,
+        canFilter = ARPG_CutawayInfo()
     if asked ~= 1 then
         ns.Print("Inside view: not in use at the moment.")
         return
@@ -415,6 +417,13 @@ function ns:PrintCutawayProof()
     if inside == 1 then
         ns.Print(format("Inside view: %d room%s shown from inside, %s, %s.", rooms, rooms == 1 and "" or "s",
             ceiling, cutText))
+        if canFilter == 0 then
+            ns.Print("  |cffffd200The library cannot tell where scenery and creatures stand in this game file|r: "
+                .. "what the game files under a room is drawn, also when it stands outside the walls.")
+        elseif (sceneryOut or 0) + (creaturesOut or 0) > 0 then
+            ns.Print(format("  Left out for standing outside those rooms: scenery %d, creatures and objects %d.",
+                sceneryOut or 0, creaturesOut or 0))
+        end
     elseif indoors == 1 then
         -- The game says the character is indoors, but its lookup of the
         -- room under the character came back empty or with no room.
@@ -422,7 +431,27 @@ function ns:PrintCutawayProof()
             .. "drawn, sliced open (%s, %s, %s, %d rooms).", ceiling, (between or 0) > 0
             and format("line of sight blocked %.1f yd up", between) or "line of sight clear", cutText, rooms))
     elseif cutting == 1 then
-        ns.Print(format("Outdoors: a building hides you %.1f yd up; the world is %s.", between or 0, cutText))
+        local hidden = (between or 0) > 0 and format("a building hides you %.1f yd up", between)
+            or "nothing hides you any more"
+        if parts == nil or canChoose == 0 then
+            ns.Print(format("Outdoors: %s; the world is %s.", hidden, cutText))
+            if canChoose == 0 then
+                ns.Print("  |cffffd200The library cannot tell the pieces of the world apart in this game file|r, "
+                    .. "so everything on screen is cut.")
+            end
+        elseif parts < 0 then
+            ns.Print(format("Outdoors: %s; which part of it could not be told, so the whole world is %s.", hidden,
+                cutText))
+        elseif parts == 0 then
+            ns.Print(format("Outdoors: %s; the cut is on its way out.", hidden))
+        else
+            ns.Print(format("Outdoors: %s; %d part%s of it, with the rooms inside, %s. The rest is whole.", hidden,
+                parts, parts == 1 and "" or "s", cutText))
+            if (sceneryOut or 0) + (creaturesOut or 0) > 0 then
+                ns.Print(format("  Left out for sitting on those parts above the cut: scenery %d, creatures and "
+                    .. "objects %d.", sceneryOut or 0, creaturesOut or 0))
+            end
+        end
     else
         ns.Print("Inside view: on. You are outdoors, and nothing is cut.")
     end
@@ -454,7 +483,7 @@ function ns:PrintHelp()
     ns.Print("  /arpg - turn the mode on or off (also: /arpg on, /arpg off)")
     ns.Print("  /arpg wasd - lock or unlock WASD movement (in combat use the key binding)")
     ns.Print("  /arpg options - all settings (also: /arpg angle 60, /arpg distance 22, /arpg rotation 0)")
-    ns.Print("  /arpg cut - buildings shown from inside, on or off (/arpg cut 4: wall height; /arpg cut outdoors: slice the world outdoors too)")
+    ns.Print("  /arpg cut - buildings shown from inside, on or off (/arpg cut 4: wall height; /arpg cut outdoors: open up a building that hides you outdoors, too)")
     ns.Print("  /arpg ground - roof and treetop clicks go to the ground, on or off (/arpg ground 3 sets the height)")
     ns.Print("  /arpg sound - hear the world from the camera or from the character")
     ns.Print("  /arpg camedit - free the camera, mouse and scroll wheel for a look around")
@@ -534,7 +563,7 @@ function ns:SetCutaway(text)
     if db.cutaway then
         ns.Print(format("Inside view on: indoors you see only the inside of the building, up to %d yards "
             .. "above your feet.%s", db.cutawayHeight, db.cutawayOutdoors
-            and " Outdoors, the world is sliced while a building hides your character." or ""))
+            and " Outdoors, a building that hides your character is opened up." or ""))
     else
         ns.Print("Inside view off: buildings are drawn whole.")
     end

@@ -2,7 +2,7 @@
 ## Title: WotLK-ARPG
 ## Notes: Diablo-style camera and controls for the 3.3.5a client.
 ## Author: kamakazedan
-## Version: 0.5.0
+## Version: 0.6.0
 ## SavedVariables: WotLKARPGDB
 ## SavedVariablesPerCharacter: WotLKARPGCharDB
 
