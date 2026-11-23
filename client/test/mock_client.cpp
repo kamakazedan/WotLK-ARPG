@@ -463,11 +463,12 @@ struct LookupRoom {
     uint32_t group;
     bool roofOver;
 };
-constexpr int kLookupRooms = 4;
+constexpr int kLookupRooms = 8;
 LookupRoom g_lookupRooms[kLookupRooms] = {};
 struct LookupCalls {
     int count;
     int slanted;
+    int upward;      // straight up
     int fractionNotOne;
     float fraction;  // the last one passed
 };
@@ -501,6 +502,7 @@ struct MockBuilding {
     alignas(4) uint8_t groupData[kMaxMockGroups][0x1A0];
     alignas(4) uint8_t placed[kMaxMockGroups][0xC0];
     alignas(4) uint8_t links[kMaxMockGroups][0x20];
+    alignas(4) uint8_t owner[0x10];  // what a placed group points back to its building through
     void* array[kMaxMockGroups];
     game::Doorway doorways[kMaxMockDoorways];
 };
@@ -525,6 +527,81 @@ MockArea g_areas[kMaxAreas];
 int g_areaCount = 0;
 alignas(4) uint8_t g_areaRecords[kMaxAreas][0x30];
 int g_areaLookups = 0;
+
+// What a line of sight meets in one building group: a solid box of it, in
+// world coordinates. The client's test of a line against one group answers
+// from these. (The slabs above are the same world as the client's test of a
+// line against everything sees it.)
+struct Solid {
+    bool present;
+    game::Box box;
+};
+Solid g_solids[kMockBuildings][kMaxMockGroups];
+struct GroupLineCalls {
+    int boxTests;
+    int tests;
+    int wrong;           // calls not made the way the client makes them
+    int withoutBoxTest;  // surfaces asked about without the box having been asked about first, with the same line
+    int hits;
+};
+GroupLineCalls g_groupLines;
+bool g_surfacesFromAboveOnly = false;  // the client's test counts a surface only for a line that comes down onto it
+struct BoxTest {
+    void* model;
+    uint32_t group;
+    game::Vec3 line[2];
+};
+BoxTest g_lastBoxTest;
+
+// Where each building's model stands in the world. The house's is turned a
+// quarter and moved: a point (x, y, z) of the world is (y, -x, z) + shift in
+// the model's own coordinates. The others' coordinates are the world's.
+constexpr game::Vec3 kHouseShift = {-1000.0f, 500.0f, -20.0f};
+
+// The groups the client's outdoor pass visits: the outsides of buildings in
+// view. (Rooms are the walk's, and the library's.)
+struct OutdoorGroup {
+    int building;
+    uint32_t group;
+};
+constexpr int kMaxOutdoorGroups = 6;
+OutdoorGroup g_outdoorGroups[kMaxOutdoorGroups];
+int g_outdoorGroupCount = 0;
+
+// Scenery and creatures, as the scene files them under the groups they stand
+// in. The client goes through each visited group's and asks, of each piece,
+// whether it shows in the group's view.
+constexpr int kMaxPieces = 12;
+struct MockPiece {
+    alignas(4) uint8_t record[0x60];  // the piece itself, laid out at the client's offsets
+    alignas(4) uint8_t model[0x10];   // its model; only its address matters
+    bool present;
+    bool creature;
+    int building;    // the group it is filed under
+    uint32_t group;
+    int also;        // a second group of the same building it is filed under as well, or -1
+    bool inView;     // what the client's own test says
+    bool drawn;      // this frame: it was put on the list of models to draw
+    int asked;       // times the test was made of it this frame
+    uint32_t answer; // what came back from the test the last time
+};
+MockPiece g_pieces[kMaxPieces];
+constexpr uint32_t kInView = 7;  // what the client's test answers for a piece in view: anything but zero
+struct InViewCalls {
+    int count;
+    int wrong;  // calls that did not arrive the way the client makes them
+};
+InViewCalls g_inViewCalls;
+alignas(4) uint8_t g_viewRecord[0x100];  // stands in for a group's view
+void* g_inViewThis = nullptr;
+uint32_t g_inViewArguments[2];           // centre, radius
+uint32_t g_inViewResult = 0;
+alignas(4) uint8_t g_treeModel[0x10];    // a tree out on the terrain: nobody is asked about it
+bool g_tree = false;
+
+// In front of each of the two calls: push radius; push centre; mov ecx, view.
+constexpr uintptr_t kSceneryInViewEntry = game::kSceneryInViewCall - 18;
+constexpr uintptr_t kCreatureInViewEntry = game::kCreatureInViewCall - 18;
 
 // ---------------------------------------------------------------------------
 // The mock client: routines, each with the real one's calling convention
@@ -777,6 +854,8 @@ bool __cdecl MockFindGroupOnLine(const game::Vec3* from, const game::Vec3* to, f
     ++g_lookups.count;
     if (from->x != to->x || from->y != to->y) {
         ++g_lookups.slanted;
+    } else if (to->z > from->z) {
+        ++g_lookups.upward;
     }
     if (fraction != 1.0f) {
         ++g_lookups.fractionNotOne;
@@ -830,7 +909,7 @@ bool __cdecl MockFindGroupOnLine(const game::Vec3* from, const game::Vec3* to, f
             bestGroup = room.group;
         }
     }
-    if (bestBuilding == nullptr) {
+    if (bestBuilding == nullptr || (GroupFlags(bestBuilding, bestGroup) & game::kGroupFlagOutdoor) != 0) {
         return false;
     }
     buildings[0] = bestBuilding;
@@ -913,9 +992,12 @@ void __cdecl MockVisit(uint32_t index, void* buildingPointer) {
     }
     // The first visit of a frame puts the group on the list of groups to
     // draw; every visit adds the view it was made under as a window onto it.
-    uint32_t& queued = game::At<uint32_t>(placed, game::kPlacedGroupQueued);
+    uintptr_t& queued = game::At<uintptr_t>(placed, game::kPlacedGroupQueued);
     const bool first = queued == 0;
-    queued = 0x00C0FFE0;
+    if (first) {
+        queued = Fixed<uintptr_t>(game::kQueuedGroupsHead);  // the group that was first, or the end of the list
+        Fixed<uintptr_t>(game::kQueuedGroupsHead) = reinterpret_cast<uintptr_t>(placed);
+    }
     if (g_visitCount < kMaxVisits) {
         g_visits[g_visitCount] = {building, index, Fixed<uint32_t>(game::kSceneInteriorPath),
                                   Fixed<int32_t>(game::kSceneFrustumLevel), first};
@@ -960,10 +1042,172 @@ int __cdecl MockBoxOutsideView(const game::Box* box) {
     return apart ? 1 : 0;
 }
 
+// int __thiscall View(const Vec3* centre, float radius): whether a piece
+// shows in a view.
+int __fastcall MockInView(void* view, void*, const game::Vec3* centre, float radius) {
+    ++g_inViewCalls.count;
+    for (MockPiece& piece : g_pieces) {
+        if (piece.present && centre == reinterpret_cast<const game::Vec3*>(piece.record + game::kSceneCentre)) {
+            if (view != g_viewRecord || radius != game::At<float>(piece.record, game::kSceneRadius)) {
+                ++g_inViewCalls.wrong;
+            }
+            return piece.inView ? static_cast<int>(kInView) : 0;
+        }
+    }
+    ++g_inViewCalls.wrong;
+    return 0;
+}
+
+// Like the real routine (0x0079A260): goes through the groups on the frame's
+// list for the scenery (0x00799B70) and the creatures (0x00793270) filed
+// under each, and puts on the list of models to draw whatever shows in the
+// group's view. A piece is asked about until one view shows it.
 void __cdecl MockFinishVisits() {
     ++g_finishVisits.count;
     g_finishVisits.visitsSeen = g_visitCount;
     g_finishVisits.clipPlaneCalls = g_d3d.setClipPlaneCalls;
+    for (uintptr_t next = Fixed<uintptr_t>(game::kQueuedGroupsHead); next != 0 && (next & 1) == 0;
+         next = game::At<uintptr_t>(reinterpret_cast<void*>(next), game::kPlacedGroupQueued)) {
+        for (int creatures = 0; creatures < 2; ++creatures) {
+            for (MockPiece& piece : g_pieces) {
+                const MockBuilding& filedIn = g_buildings[piece.building];
+                if (!piece.present || piece.drawn || piece.creature != (creatures == 1) ||
+                    (reinterpret_cast<uintptr_t>(filedIn.placed[piece.group]) != next &&
+                     (piece.also < 0 || reinterpret_cast<uintptr_t>(filedIn.placed[piece.also]) != next))) {
+                    continue;
+                }
+                ++piece.asked;
+                g_inViewThis = g_viewRecord;
+                g_inViewArguments[0] = Address(piece.record + game::kSceneCentre);
+                g_inViewArguments[1] = Bits(game::At<float>(piece.record, game::kSceneRadius));
+                g_inViewResult = 0xDEAD;
+                int popped = 0;
+                CallClient(piece.creature ? kCreatureInViewEntry : kSceneryInViewEntry, nullptr, nullptr, 0, &popped);
+                if (popped != 0) {
+                    ++g_inViewCalls.wrong;  // the stack did not come back as it went in
+                }
+                piece.answer = g_inViewResult;
+                piece.drawn = g_inViewResult != 0;
+            }
+        }
+    }
+}
+
+// The client's two steps for a line and one building group. Both get the
+// line in the model's own coordinates.
+game::Vec3 ToWorld(int building, const game::Vec3& point) {
+    if (building != 0) {
+        return point;
+    }
+    const game::Vec3 moved = {point.x - kHouseShift.x, point.y - kHouseShift.y, point.z - kHouseShift.z};
+    return {-moved.y, moved.x, moved.z};
+}
+
+bool SegmentMeetsBox(const game::Vec3& from, const game::Vec3& to, const game::Box& box, float* along) {
+    const float start[3] = {from.x, from.y, from.z};
+    const float step[3] = {to.x - from.x, to.y - from.y, to.z - from.z};
+    const float low[3] = {box.low.x, box.low.y, box.low.z};
+    const float high[3] = {box.high.x, box.high.y, box.high.z};
+    float enter = 0.0f;
+    float leave = 1.0f;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (step[axis] > -0.00001f && step[axis] < 0.00001f) {
+            if (start[axis] < low[axis] || start[axis] > high[axis]) {
+                return false;
+            }
+            continue;
+        }
+        float a = (low[axis] - start[axis]) / step[axis];
+        float b = (high[axis] - start[axis]) / step[axis];
+        if (a > b) {
+            const float swap = a;
+            a = b;
+            b = swap;
+        }
+        enter = a > enter ? a : enter;
+        leave = b < leave ? b : leave;
+        if (enter > leave) {
+            return false;
+        }
+    }
+    *along = enter;
+    return true;
+}
+
+int BuildingOfModel(const void* model) {
+    for (int i = 0; i < kMockBuildings; ++i) {
+        if (g_buildings[i].model == model) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// bool __thiscall Model(const Vec3* from, const Vec3* to, uint32_t group)
+// (0x007AE880): whether the line touches the group's box.
+bool __fastcall MockLineTouchesGroupBox(uint8_t* model, void*, const game::Vec3* from, const game::Vec3* to,
+                                        uint32_t group) {
+    ++g_groupLines.boxTests;
+    g_lastBoxTest = {model, group, {*from, *to}};
+    const int building = BuildingOfModel(model);
+    if (building < 0 || group >= game::At<uint32_t>(model, game::kModelGroupCount)) {
+        ++g_groupLines.wrong;
+        return false;
+    }
+    if ((game::At<uint32_t>(g_buildings[building].groupData[group], game::kGroupDataLoadFlags) &
+         game::kGroupDataLoaded) == 0) {
+        return false;
+    }
+    float along = 0.0f;
+    return SegmentMeetsBox(ToWorld(building, *from), ToWorld(building, *to),
+                           game::At<game::Box>(g_buildings[building].placed[group], game::kPlacedGroupBounds), &along);
+}
+
+// bool __thiscall GroupData(const Vec3 line[2], float* fraction, uint32_t
+// flags, uint32_t surfaces, uint8_t* out, void* building) (0x007CB0C0):
+// whether the line meets a surface of the group, and how far along.
+bool __fastcall MockLineMeetsGroup(uint8_t* data, void*, const game::Vec3* line, float* fraction, uint32_t flags,
+                                   uint32_t surfaces, uint8_t* out, void* placedBuilding) {
+    ++g_groupLines.tests;
+    int building = -1;
+    uint32_t group = 0;
+    for (int b = 0; b < kMockBuildings && building < 0; ++b) {
+        for (uint32_t g = 0; g < static_cast<uint32_t>(kMaxMockGroups); ++g) {
+            if (g_buildings[b].groupData[g] == data) {
+                building = b;
+                group = g;
+                break;
+            }
+        }
+    }
+    bool scratchClean = true;
+    for (size_t i = 0; i < game::kLineScratchWords; ++i) {
+        scratchClean = scratchClean && Fixed<uint32_t>(game::kLineScratch + 4 * i) == 0;
+    }
+    Fixed<uint32_t>(game::kLineScratch + 4) = 1;  // what the real one leaves behind: the next caller has to clear it
+    if (building < 0 || placedBuilding != g_buildings[building].building || flags != game::kIntersectBuildings ||
+        surfaces != 0x82 || *fraction != 1.0f || out == nullptr || !scratchClean ||
+        (game::At<uint32_t>(data, game::kGroupDataLoadFlags) & game::kGroupDataLoaded) == 0) {
+        ++g_groupLines.wrong;
+        return false;
+    }
+    const BoxTest& box = g_lastBoxTest;
+    if (box.model != g_buildings[building].model || box.group != group || box.line[0].x != line[0].x ||
+        box.line[0].y != line[0].y || box.line[0].z != line[0].z || box.line[1].x != line[1].x ||
+        box.line[1].y != line[1].y || box.line[1].z != line[1].z) {
+        ++g_groupLines.withoutBoxTest;
+    }
+    const Solid& solid = g_solids[building][group];
+    float along = 0.0f;
+    if (!solid.present || !SegmentMeetsBox(ToWorld(building, line[0]), ToWorld(building, line[1]), solid.box, &along)) {
+        return false;
+    }
+    if (g_surfacesFromAboveOnly && !(line[0].z > line[1].z)) {
+        return false;
+    }
+    ++g_groupLines.hits;
+    *fraction = along;
+    return true;
 }
 
 void __cdecl MockBeforeDrawing() {
@@ -1098,6 +1342,57 @@ constexpr uintptr_t kDrawSyncRoutine = CallTarget(game::kDrawSyncCall, game::kDr
 constexpr uintptr_t kDrawSyncExRoutine = CallTarget(game::kDrawSyncExCall, game::kDrawSyncExCallBytes);
 constexpr uintptr_t kWorldDrawnRoutine = CallTarget(game::kWorldDrawnCall, game::kWorldDrawnCallBytes);
 
+// The call that draws one building group. In front of it: push views; push
+// placement; push group; mov ecx, model.
+constexpr uintptr_t kDrawGroupEntry = game::kDrawGroupCall - 24;
+constexpr uintptr_t kDrawGroupRoutine = CallTarget(game::kDrawGroupCall, game::kDrawGroupCallBytes);
+void* g_drawGroupThis = nullptr;
+uint32_t g_drawGroupArguments[3];  // group, placement, views
+void __fastcall MockDrawGroup(uint8_t* model, void*, uint32_t index, uint8_t* placement, void* views);
+
+// The model renderer. The library leaves it alone: one model cannot be cut
+// by itself, since the client draws many of a kind in a single draw. The
+// mock runs it all the same, laid out as in the client, so that the tests
+// can tell what each model was drawn with.
+//
+// In a pass (0x00823CB0), void __thiscall Context(uint32_t pass, void*
+// elements, void* order, uint32_t count) (0x00823130, called from two
+// places) draws the elements one after another; for each, with the
+// element's model in the context at +0x60, it first makes a call of its own
+// (0x0081C840, at 0x00823A67).
+constexpr uintptr_t kDrawModelsCall = 0x00823D1F;
+constexpr uint8_t kDrawModelsCallBytes[] = {0xE8, 0x0C, 0xF4, 0xFF, 0xFF};
+constexpr uintptr_t kDrawMoreModelsCall = 0x00823D3B;
+constexpr uint8_t kDrawMoreModelsCallBytes[] = {0xE8, 0xF0, 0xF3, 0xFF, 0xFF};
+constexpr uintptr_t kModelElementCall = 0x00823A67;
+constexpr uint8_t kModelElementCallBytes[] = {0xE8, 0xD4, 0x8D, 0xFF, 0xFF};
+constexpr size_t kModelContextModel = 0x60;
+
+// The two calls that draw a list of elements. In front of each: push count;
+// push order; push elements; push pass; mov ecx, context. The second sits
+// right behind the first, as in the client.
+struct MockElement {
+    uint32_t type;
+    void* model;
+};
+constexpr uint32_t kMockElements = 16;
+constexpr uint32_t kModelPass = 2;
+MockElement g_elements[2][kMockElements];
+uint32_t g_elementOrder[2][kMockElements];
+alignas(4) uint8_t g_modelContext[0xC0];
+alignas(4) uint8_t g_elementSelf[8];
+alignas(4) uint8_t g_elementArgument[8];
+constexpr uintptr_t kDrawModelsEntry = kDrawModelsCall - 22;
+constexpr uintptr_t kDrawMoreModelsEntry = kDrawMoreModelsCall - 22;
+constexpr uintptr_t kDrawModelsRoutine = CallTarget(kDrawModelsCall, kDrawModelsCallBytes);
+void __fastcall MockDrawModels(uint8_t* context, void*, uint32_t pass, MockElement* elements, uint32_t* order,
+                               uint32_t count);
+// And the call made for each element. In front of it: push argument; mov
+// ecx, self.
+constexpr uintptr_t kModelElementEntry = kModelElementCall - 10;
+constexpr uintptr_t kModelElementRoutine = CallTarget(kModelElementCall, kModelElementCallBytes);
+void __fastcall MockModelElement(void* self, void*, void* argument);
+
 // The client's own instructions in front of the walk through the rooms:
 // mov ecx,[kSceneCameraBuilding]; push the list of the camera's groups.
 constexpr uint8_t kWalkRoomsLeadIn[] = {0x8B, 0x0D, 0xA4, 0x87, 0xCD, 0x00, 0x68, 0xD4, 0xB0, 0xCD, 0x00};
@@ -1148,6 +1443,12 @@ bool AddressesFit() {
         kDrawSyncRoutine,            kDrawSyncExRoutine,           game::kWorldDrawnCall,
         kWorldDrawnEntry,            kWorldDrawnRoutine,           game::kGxDeviceClassDirect3D9,
         game::kGxDeviceClassDirect3D9Ex, kOtherDeviceClass,
+        game::kQueuedGroupsHead,     game::kQueuedGroupsLinkOffset, game::kLineScratch,
+        game::kLineTouchesGroupBox,  game::kLineMeetsGroup,        game::kSceneryInViewCall,
+        game::kCreatureInViewCall,   game::kDrawGroupCall,         kDrawModelsCall,
+        kDrawMoreModelsCall,   kModelElementCall,      kDrawGroupRoutine,
+        kDrawModelsRoutine,          kModelElementRoutine,
+        CallTarget(game::kSceneryInViewCall, game::kSceneryInViewCallBytes),
     };
     for (uintptr_t address : addresses) {
         if (!Fits(address)) {
@@ -1279,6 +1580,77 @@ void BuildClient() {
     static const uint8_t kDropTwoAgain[] = {0x83, 0xC4, 0x08, 0xC3};  // add esp,8; ret
     Bytes(at, kDropTwoAgain, sizeof(kDropTwoAgain));
     JumpAt(kWorldDrawnRoutine, CodeAddress(MockWorldDrawn));
+
+    // The calls the cutaway tells pieces apart at. Each sits at the client's
+    // address with the arguments put in place in front of it.
+    const auto pushFrom = [&](const void* variable) {  // push dword [variable]
+        Fixed<uint8_t>(at++) = 0xFF;
+        Fixed<uint8_t>(at++) = 0x35;
+        Word(at, Address(variable));
+    };
+    const auto thisFrom = [&](const void* variable) {  // mov ecx, [variable]
+        Fixed<uint8_t>(at++) = 0x8B;
+        Fixed<uint8_t>(at++) = 0x0D;
+        Word(at, Address(variable));
+    };
+    const auto pushValue = [&](uint32_t value) {  // push value
+        Fixed<uint8_t>(at++) = 0x68;
+        Word(at, value);
+    };
+    const auto thisValue = [&](uint32_t value) {  // mov ecx, value
+        Fixed<uint8_t>(at++) = 0xB9;
+        Word(at, value);
+    };
+
+    at = kDrawGroupEntry;
+    pushFrom(&g_drawGroupArguments[2]);
+    pushFrom(&g_drawGroupArguments[1]);
+    pushFrom(&g_drawGroupArguments[0]);
+    thisFrom(&g_drawGroupThis);
+    Bytes(at, game::kDrawGroupCallBytes, sizeof(game::kDrawGroupCallBytes));  // lands on kDrawGroupCall
+    Fixed<uint8_t>(at++) = 0xC3;
+    JumpAt(kDrawGroupRoutine, CodeAddress(MockDrawGroup));
+
+    const uintptr_t inViewEntries[2] = {kSceneryInViewEntry, kCreatureInViewEntry};
+    const uint8_t* inViewCalls[2] = {game::kSceneryInViewCallBytes, game::kCreatureInViewCallBytes};
+    for (int i = 0; i < 2; ++i) {
+        at = inViewEntries[i];
+        pushFrom(&g_inViewArguments[1]);
+        pushFrom(&g_inViewArguments[0]);
+        thisFrom(&g_inViewThis);
+        Bytes(at, inViewCalls[i], 5);  // lands on the client's address for the call
+        Fixed<uint8_t>(at++) = 0xA3;   // mov [address], eax
+        Word(at, Address(&g_inViewResult));
+        Fixed<uint8_t>(at++) = 0xC3;
+    }
+    JumpAt(CallTarget(game::kSceneryInViewCall, game::kSceneryInViewCallBytes), CodeAddress(MockInView));
+
+    const uintptr_t modelEntries[2] = {kDrawModelsEntry, kDrawMoreModelsEntry};
+    const uint8_t* modelCalls[2] = {kDrawModelsCallBytes, kDrawMoreModelsCallBytes};
+    for (int i = 0; i < 2; ++i) {
+        at = modelEntries[i];
+        pushValue(kMockElements);
+        pushValue(Address(g_elementOrder[i]));
+        pushValue(Address(g_elements[i]));
+        Fixed<uint8_t>(at++) = 0x6A;  // push the pass
+        Fixed<uint8_t>(at++) = static_cast<uint8_t>(kModelPass);
+        thisValue(Address(g_modelContext));
+        Bytes(at, modelCalls[i], 5);
+        Fixed<uint8_t>(at++) = 0xC3;
+    }
+    JumpAt(kDrawModelsRoutine, CodeAddress(MockDrawModels));
+
+    at = kModelElementEntry;
+    pushValue(Address(g_elementArgument));
+    thisValue(Address(g_elementSelf));
+    Bytes(at, kModelElementCallBytes, sizeof(kModelElementCallBytes));
+    Fixed<uint8_t>(at++) = 0xC3;
+    JumpAt(kModelElementRoutine, CodeAddress(MockModelElement));
+
+    JumpAt(game::kLineTouchesGroupBox, CodeAddress(MockLineTouchesGroupBox));
+    JumpAt(game::kLineMeetsGroup, CodeAddress(MockLineMeetsGroup));
+    Fixed<uintptr_t>(game::kQueuedGroupsHead) = kListEnd;
+    Fixed<int32_t>(game::kQueuedGroupsLinkOffset) = static_cast<int32_t>(game::kPlacedGroupQueued - sizeof(void*));
 
     JumpAt(game::kFindGroupOnLine, CodeAddress(MockFindGroupOnLine));
     JumpAt(game::kIntersectTerrain, CodeAddress(MockIntersectTerrain));
@@ -2234,6 +2606,80 @@ Draw ClientDraws(bool shader, uint32_t clientsPlanes) {
     return draw;
 }
 
+// The scene draws the groups on the frame's list one at a time, each by
+// void __thiscall Model(uint32_t group, const Matrix* placement, void* views)
+// (0x007ABF50).
+struct GroupDraw {
+    void* model;
+    uint32_t index;
+    void* placement;
+    void* views;
+    Draw draw;
+};
+constexpr int kMaxGroupDraws = 32;
+GroupDraw g_groupDraws[kMaxGroupDraws];
+int g_groupDrawCount = 0;
+
+void __fastcall MockDrawGroup(uint8_t* model, void*, uint32_t index, uint8_t* placement, void* views) {
+    if (g_groupDrawCount < kMaxGroupDraws) {
+        g_groupDraws[g_groupDrawCount] = {model, index, placement, views, ClientDraws(true, 0)};
+    }
+    ++g_groupDrawCount;
+}
+
+// The model renderer. A pass (0x00823CB0) hands its record and a list of
+// elements to void __thiscall Context(uint32_t pass, void* elements, void*
+// order, uint32_t count) (0x00823130), from two places; that routine puts
+// each element's model in the record, makes a call of its own (0x0081C840,
+// at 0x00823A67) and draws the element.
+struct ModelDraw {
+    void* model;
+    bool more;  // drawn by the second of the two calls
+    Draw draw;
+};
+ModelDraw g_modelDraws[2 * kMockElements];
+int g_modelDrawCount = 0;
+struct ModelCalls {
+    int passes;
+    int elements;
+    int wrong;  // calls that did not arrive the way the client makes them
+};
+ModelCalls g_modelCalls;
+void __fastcall MockModelElement(void* self, void*, void* argument) {
+    ++g_modelCalls.elements;
+    if (self != g_elementSelf || argument != g_elementArgument) {
+        ++g_modelCalls.wrong;
+    }
+}
+
+void __fastcall MockDrawModels(uint8_t* context, void*, uint32_t pass, MockElement* elements, uint32_t* order,
+                               uint32_t count) {
+    ++g_modelCalls.passes;
+    const int which = elements == g_elements[1] ? 1 : 0;
+    if (context != g_modelContext || pass != kModelPass || elements != g_elements[which] ||
+        order != g_elementOrder[which] || count != kMockElements) {
+        ++g_modelCalls.wrong;
+        return;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        void* model = elements[order[i]].model;
+        if (model == nullptr) {
+            continue;
+        }
+        game::At<void*>(context, kModelContextModel) = model;
+        int popped = 0;
+        CallClient(kModelElementEntry, nullptr, nullptr, 0, &popped);
+        if (popped != 0) {
+            ++g_modelCalls.wrong;
+        }
+        if (g_modelDrawCount < static_cast<int>(2 * kMockElements)) {
+            g_modelDraws[g_modelDrawCount] = {model, which == 1, ClientDraws(true, 0)};
+        }
+        ++g_modelDrawCount;
+    }
+    // (The last model stays in the record, as it does in the client.)
+}
+
 // What one frame was drawn with.
 struct DrawnFrame {
     game::Matrix hardware;  // the device's hardware projection while the world was drawn
@@ -2255,7 +2701,11 @@ struct DrawnFrame {
     float depthClearTo;
     bool depthClearPlain;     // ... made of the whole view, of nothing but depth, after the client's own clear
     bool projectionKept;      // nobody wrote to the device's projection while the world was drawn
-    Draw world;               // terrain and buildings
+    Draw world;               // terrain
+    Draw afterModels;         // terrain again, right after the model renderer's first pass
+    Draw afterGroups;         // and right after the buildings' groups
+    int stackAfterGroups;
+    int stackAfterModels;
     Draw clipped;             // a model the client clips with a plane of its own
     Draw plainClipped;        // the same without a vertex shader
     Draw plain;               // something drawn without a vertex shader
@@ -2312,6 +2762,12 @@ void RenderWorldFrame() {
     Fixed<game::OutdoorWindow>(game::kSceneSkyWindow) = game::kNoOutdoorWindow;
     Fixed<game::OutdoorWindow>(game::kSceneOutdoorWindow) = game::kNoOutdoorWindow;
     g_visitCount = 0;
+    g_groupDrawCount = 0;
+    g_modelDrawCount = 0;
+    for (MockPiece& piece : g_pieces) {
+        piece.drawn = false;
+        piece.asked = 0;
+    }
     const Direct3D before = g_d3d;
     CallClient(game::kLocateCameraCall, nullptr, nullptr, 0, &g_drawn.stackAfterLocate);
 
@@ -2328,6 +2784,12 @@ void RenderWorldFrame() {
         Fixed<game::OutdoorWindow>(game::kSceneOutdoorWindow) = kWholeScreen;
     }
     g_drawn.outdoorWorld = Fixed<game::OutdoorWindow>(game::kSceneOutdoorWindow).depth >= 0.0f;
+    if (g_drawn.outdoorWorld) {
+        // The outdoor pass (0x0079A790): the outsides of the buildings in view.
+        for (int i = 0; i < g_outdoorGroupCount; ++i) {
+            MockVisit(g_outdoorGroups[i].group, g_buildings[g_outdoorGroups[i].building].building);
+        }
+    }
     g_drawn.visitsBeforeDealing = g_visitCount;
 
     // Then the two routines that close the search.
@@ -2351,6 +2813,41 @@ void RenderWorldFrame() {
     g_drawn.view = view;
     g_drawn.eye = eye;
     g_drawn.world = ClientDraws(true, 0);
+
+    // The model renderer's first pass (0x00823CB0, called at 0x004F911D):
+    // every model put on its list, a tree on the terrain among them.
+    for (int which = 0; which < 2; ++which) {
+        uint32_t used = 0;
+        for (uint32_t i = 0; i < kMockElements; ++i) {
+            g_elements[which][i] = {0, nullptr};
+            g_elementOrder[which][i] = i;
+        }
+        if (g_tree) {
+            g_elements[which][used++] = {0, g_treeModel};
+        }
+        for (int i = 0; i < kMaxPieces && used < kMockElements; ++i) {
+            const MockPiece& piece = g_pieces[which == 0 ? i : kMaxPieces - 1 - i];
+            if (piece.present && piece.drawn) {
+                g_elements[which][used++] = {0, const_cast<uint8_t*>(piece.model)};
+            }
+        }
+    }
+    CallClient(kDrawModelsEntry, nullptr, nullptr, 0, &g_drawn.stackAfterModels);
+    g_drawn.afterModels = ClientDraws(true, 0);
+
+    // The scene's groups (0x007964A0), in the order they are on the list.
+    for (uintptr_t next = Fixed<uintptr_t>(game::kQueuedGroupsHead); next != 0 && (next & 1) == 0;
+         next = game::At<uintptr_t>(reinterpret_cast<void*>(next), game::kPlacedGroupQueued)) {
+        uint8_t* placed = reinterpret_cast<uint8_t*>(next);
+        uint8_t* building = game::At<uint8_t*>(game::At<uint8_t*>(placed, game::kPlacedGroupOwner), game::kOwnerBuilding);
+        g_drawGroupThis = game::At<uint8_t*>(building, game::kBuildingModel);
+        g_drawGroupArguments[0] = game::At<uint32_t>(placed, game::kPlacedGroupIndex);
+        g_drawGroupArguments[1] = Address(building + game::kBuildingPlacement);
+        g_drawGroupArguments[2] = Address(placed + 0x6C);
+        CallClient(kDrawGroupEntry, nullptr, nullptr, 0, &g_drawn.stackAfterGroups);
+    }
+    g_drawn.afterGroups = ClientDraws(true, 0);
+
     g_drawn.clipped = ClientDraws(true, 1);
     g_drawn.plainClipped = ClientDraws(false, 1);
     g_drawn.plain = ClientDraws(false, 0);
@@ -2360,6 +2857,7 @@ void RenderWorldFrame() {
     g_drawn.other = ClientDraws(true, 0);
     game::At<game::Matrix>(g_device, game::kGxDeviceHardwareProjection) = g_drawn.hardware;
     g_drawn.seeThrough = ClientDraws(true, 0);
+    CallClient(kDrawMoreModelsEntry, nullptr, nullptr, 0, &g_drawn.stackAfterModels);
     g_drawn.lastClipped = ClientDraws(true, 1);
 
     // The last of it is the sorted list of effects (0x004F920B). The sun's
@@ -2375,9 +2873,10 @@ void RenderWorldFrame() {
     // The frame's list of groups to draw is emptied...
     for (MockBuilding& mock : g_buildings) {
         for (int i = 0; i < kMaxMockGroups; ++i) {
-            game::At<uint32_t>(mock.placed[i], game::kPlacedGroupQueued) = 0;
+            game::At<uintptr_t>(mock.placed[i], game::kPlacedGroupQueued) = 0;
         }
     }
+    Fixed<uintptr_t>(game::kQueuedGroupsHead) = kListEnd;
 
     // ...the device put back, and the interface drawn.
     DeviceSetProjection(saved);
@@ -2483,6 +2982,21 @@ void PlaceBuilding(MockBuilding& mock, int number, const GroupSpec* specs, int c
     game::At<game::Doorway*>(mock.model, game::kModelDoorways) = mock.doorways;
     game::At<uint32_t>(mock.model, game::kModelGroupCount) = static_cast<uint32_t>(count);
     game::At<uint32_t>(mock.model, game::kModelLoaded) = modelLoaded ? 1 : 0;
+    game::At<uint8_t*>(mock.owner, game::kOwnerBuilding) = mock.building;
+    game::Matrix placement = {};
+    placement.m[2][2] = 1.0f;
+    placement.m[3][3] = 1.0f;
+    if (number == 0) {
+        placement.m[1][0] = 1.0f;   // the model's x is the world's y
+        placement.m[0][1] = -1.0f;  // and its y the world's x, the other way round
+        placement.m[3][0] = kHouseShift.x;
+        placement.m[3][1] = kHouseShift.y;
+        placement.m[3][2] = kHouseShift.z;
+    } else {
+        placement.m[0][0] = 1.0f;
+        placement.m[1][1] = 1.0f;
+    }
+    game::At<game::Matrix>(mock.building, game::kBuildingPlacement) = placement;
 
     uintptr_t next = kListEnd;
     for (int i = count - 1; i >= 0; --i) {
@@ -2494,6 +3008,7 @@ void PlaceBuilding(MockBuilding& mock, int number, const GroupSpec* specs, int c
         game::At<uint32_t>(mock.groupData[i], game::kGroupDataAreaId) = kAreaNumber + 10 * static_cast<uint32_t>(i);
         game::At<game::Box>(mock.placed[i], game::kPlacedGroupBounds) = specs[i].box;
         game::At<uint32_t>(mock.placed[i], game::kPlacedGroupIndex) = static_cast<uint32_t>(i);
+        game::At<uint8_t*>(mock.placed[i], game::kPlacedGroupOwner) = mock.owner;
         game::At<void*>(mock.links[i], game::kGroupLinkGroup) = mock.placed[i];
         game::At<uintptr_t>(mock.links[i], kGroupListLinkOffset + sizeof(void*)) = next;
         next = reinterpret_cast<uintptr_t>(mock.links[i]);
@@ -2642,6 +3157,11 @@ struct CutawayInfo {
     uint32_t groupFlags;
     int area;
     int doorsOut;
+    int parts;
+    int sceneryOut;
+    int creaturesOut;
+    bool canChoose;
+    bool canFilter;
 };
 
 CutawayInfo Info() {
@@ -2667,6 +3187,11 @@ CutawayInfo Info() {
     info.groupFlags = static_cast<uint32_t>(n[16]);
     info.area = static_cast<int>(n[17]);
     info.doorsOut = static_cast<int>(n[18]);
+    info.parts = static_cast<int>(n[19]);
+    info.sceneryOut = static_cast<int>(n[20]);
+    info.creaturesOut = static_cast<int>(n[21]);
+    info.canChoose = n[22] != 0.0;
+    info.canFilter = n[23] != 0.0;
     return info;
 }
 
@@ -2791,7 +3316,8 @@ void TestCutawayOff() {
     g_doorToOutdoors = false;
 
     const CutawayInfo info = Info();
-    CheckEqual(info.results, 19, "ARPG_CutawayInfo returns nineteen values");
+    CheckEqual(info.results, 24, "ARPG_CutawayInfo returns twenty-four values");
+    Check(info.canChoose && info.canFilter, "all three calls for telling pieces apart are redirected as well");
     Check(!info.asked && !info.cutting && info.framesCut == 0, "nothing asked for, nothing cut");
     Check(info.frames >= 2, "though it has seen the frames go by");
 }
@@ -2906,7 +3432,10 @@ void TestCutawayIndoors() {
           "after each draw the stack is as the client left it");
     info = Info();
     Check(info.framesCut > 0 && info.framesSkipped == 0, "ARPG_CutawayInfo counts the frames drawn cut, none skipped");
-    CheckEqual(info.draws, 4, "and the four draws of the last frame that were made with the plane on");
+    CheckEqual(g_groupDrawCount, g_visitCount, "every group on the frame's list is drawn");
+    CheckEqual(info.draws, 6 + g_groupDrawCount,
+               "and the draws of the last frame that were made with the plane on: six of the world at large, and one "
+               "for each building group");
 
     int planes = g_d3d.setClipPlaneCalls;
     int popped = -1;
@@ -3173,6 +3702,376 @@ void TestCutawayOutdoors() {
     g_intersectLies = false;
     g_slabs[0].present = false;
     SettleFrames();
+    SetCutaway(kCutHeight);
+}
+
+// What a group or a model was drawn with this frame, or null if it was not
+// drawn.
+const Draw* GroupDrawn(int building, uint32_t index) {
+    const int count = g_groupDrawCount < kMaxGroupDraws ? g_groupDrawCount : kMaxGroupDraws;
+    for (int i = 0; i < count; ++i) {
+        if (g_groupDraws[i].model == g_buildings[building].model && g_groupDraws[i].index == index) {
+            return &g_groupDraws[i].draw;
+        }
+    }
+    return nullptr;
+}
+
+const Draw* ModelDrawn(const void* model, bool more) {
+    const int count = g_modelDrawCount < static_cast<int>(2 * kMockElements) ? g_modelDrawCount
+                                                                              : static_cast<int>(2 * kMockElements);
+    for (int i = 0; i < count; ++i) {
+        if (g_modelDraws[i].model == model && g_modelDraws[i].more == more) {
+            return &g_modelDraws[i].draw;
+        }
+    }
+    return nullptr;
+}
+
+bool WithPlane(const Draw* draw) {
+    return draw != nullptr && (draw->clipPlanesOn & kLibrarysBit) != 0;
+}
+
+bool Whole(const Draw* draw) {
+    return draw != nullptr && (draw->clipPlanesOn & kLibrarysBit) == 0;
+}
+
+MockPiece& PutPiece(int slot, bool creature, int building, uint32_t group, const game::Vec3& centre) {
+    MockPiece& piece = g_pieces[slot];
+    piece = {};
+    piece.present = true;
+    piece.creature = creature;
+    piece.building = building;
+    piece.group = group;
+    piece.also = -1;
+    piece.inView = true;
+    game::At<void*>(piece.record, game::kSceneModel) = piece.model;
+    game::At<game::Vec3>(piece.record, game::kSceneCentre) = centre;
+    game::At<float>(piece.record, game::kSceneRadius) = 1.25f;
+    return piece;
+}
+
+void ClearPieces() {
+    for (MockPiece& piece : g_pieces) {
+        piece = {};
+    }
+    g_tree = false;
+}
+
+void TestOnlyWhatIsInTheWay() {
+    Section("cutaway outdoors: only what is in the way is cut");
+    SetCamera(0.0, 60.0, 22.0);
+    g_playerPosition = kFeet;
+    g_outdoors = true;
+    g_characterRoom = {nullptr, 0};
+    g_cameraStandsIn = {nullptr, 0};
+    g_slabs[0] = {true, 20.0f, 21.0f, kEverywhere};  // the roof of the house, between the camera and the character
+    g_slabs[1].present = false;
+    // The client's outdoor pass draws the outsides of buildings: the house's
+    // shell, its porch and the part of it that is always drawn; the hut next
+    // door; and a wing of the house a long way off. The roof is a surface of
+    // the shell.
+    g_outdoorGroups[0] = {0, kOuterShell};
+    g_outdoorGroups[1] = {0, kPorch};
+    g_outdoorGroups[2] = {0, kAlwaysDrawn};
+    g_outdoorGroups[3] = {2, 0};
+    g_outdoorGroups[4] = {0, kFarWing};
+    g_outdoorGroupCount = 5;
+    for (auto& building : g_solids) {
+        for (Solid& solid : building) {
+            solid = {};
+        }
+    }
+    const Solid kRoof = {true, {{80.0f, 180.0f, 20.0f}, {120.0f, 220.0f, 21.0f}}};
+    g_solids[0][kOuterShell] = kRoof;
+    ClearPieces();
+    g_tree = true;
+    MockPiece& lantern = PutPiece(0, false, 0, kOuterShell, {95.0f, 200.0f, 25.0f});    // on the house's wall, high up
+    MockPiece& lampPost = PutPiece(1, false, 0, kAlwaysDrawn, {60.0f, 200.0f, 12.0f});  // down the street
+    MockPiece& passerBy = PutPiece(2, true, 0, kAlwaysDrawn, {60.0f, 210.0f, 11.0f});   // in the street
+    MockPiece& unseen = PutPiece(3, false, 0, kOuterShell, {96.0f, 201.0f, 25.0f});     // on the wall too, out of view
+    unseen.inView = false;
+    MockPiece& sign = PutPiece(4, false, 0, kOuterShell, {79.2f, 200.0f, 25.0f});       // sticking out from the wall
+    MockPiece& pigeon = PutPiece(5, true, 0, kOuterShell, {100.0f, 205.0f, 26.0f});     // on the roof
+    MockPiece& banner = PutPiece(6, false, 0, kOuterShell, {95.0f, 203.0f, 20.5f});     // hanging down to below the cut
+    MockPiece& barrel = PutPiece(7, false, 0, kOuterShell, {95.0f, 197.0f, 11.0f});     // at the foot of the wall
+    MockPiece& vane = PutPiece(8, false, 0, kOuterShell, {100.0f, 195.0f, 45.0f});      // high over the roof
+    MockPiece& farLantern = PutPiece(9, false, 0, kAlwaysDrawn, {60.0f, 195.0f, 25.0f}); // as high, down the street
+    g_groupLines = {};
+    g_inViewCalls = {};
+    g_modelCalls = {};
+    SetCutawayOutdoorsToo(kCutHeight);
+    FramesFor(300);
+    CutawayInfo info = SettleFrames();
+    Check(info.cutting && info.blocked && !info.indoors && !info.inside, "the roof hides the character: a cut is made");
+    CheckNear(info.height, 10.0f - 0.3f, "just under the roof");
+    Check(g_groupLines.tests > 0 && g_groupLines.wrong == 0 && g_groupLines.withoutBoxTest == 0,
+          "each group about to be drawn is put to the client's own test of a line against one group, asked as the "
+          "client asks it: the box first, then the surfaces, with the line in the model's own coordinates");
+    Check(g_groupLines.hits > 0, "and the lines of sight meet the shell, turned and moved as its model is");
+    CheckEqual(info.parts, 1, "ARPG_CutawayInfo: one part of a building is in the way");
+    const game::Vec3 underRoof = {100.0f, 200.0f, 18.0f};
+    const game::Vec3 roof = {100.0f, 200.0f, 20.5f};
+    const Draw* shell = GroupDrawn(0, kOuterShell);
+    Check(WithPlane(shell) && DrawnBy(*shell, underRoof) && !DrawnBy(*shell, roof),
+          "the shell is drawn with the plane on: its walls up to the cut, its roof not");
+    Check(Whole(GroupDrawn(0, kAlwaysDrawn)), "a part of the house that is not in the way is drawn whole");
+    Check(Whole(GroupDrawn(2, 0)), "so is the hut next door, whose only room has the same number as the shell");
+    Check(g_drawn.world.clipPlanesOn == 0 && DrawnBy(g_drawn.world, roof), "and the terrain");
+    Check(g_drawn.afterModels.clipPlanesOn == 0 && g_drawn.afterGroups.clipPlanesOn == 0,
+          "also right after the models and right after the buildings: the plane does not stay on behind a piece");
+    Check(g_drawn.seeThrough.clipPlanesOn == 0 && g_drawn.clipped.clipPlanesOn == 1,
+          "and whatever else is drawn, with the client's own plane left as the client has it");
+    Check(Visited(0, kRoomOfCharacter, 1) && Visited(0, kRoomUpstairs, 1),
+          "the rooms inside the house are queued, so that the house is not empty");
+    CheckEqual(g_visitCount, 5 + 7, "those, and no room of a building that stays whole");
+    Check(WithPlane(GroupDrawn(0, kRoomOfCharacter)) && WithPlane(GroupDrawn(0, kRoomUpstairs)),
+          "and cut like the shell around them");
+    Check(WithPlane(GroupDrawn(0, kPorch)), "so is the porch, which the game's table counts as indoors");
+    Check(Whole(GroupDrawn(0, kCourtyard)),
+          "the courtyard, which it counts as outdoors, is not: no more than a street running past the house");
+    Check(Whole(GroupDrawn(0, kFarWing)), "nor is a wing of the same model a long way from the part in the way");
+    CheckEqual(g_drawn.stackAfterGroups, 0, "after a group is drawn the stack is as the client left it");
+
+    // A model cannot be cut by itself. What stands on the part in the way,
+    // wholly above the cut, is left out; the rest is drawn whole.
+    Check(lampPost.drawn && lampPost.answer == kInView && passerBy.drawn,
+          "scenery and creatures down the street are drawn, and the client gets its own test's answer back");
+    Check(!unseen.drawn && unseen.answer == 0, "what the client's test says is out of view stays out");
+    CheckEqual(g_inViewCalls.wrong, 0, "the client's test is asked as the client asks it");
+    Check(!lantern.drawn && lantern.answer == 0,
+          "the lantern high on the wall of the house goes with the wall: for the client it is out of view");
+    Check(!sign.drawn, "so does a sign that sticks out from the wall a little");
+    Check(!pigeon.drawn && !vane.drawn, "and what sits on the roof, and the weather vane high over it");
+    Check(banner.drawn && barrel.drawn,
+          "a banner that hangs down to below the cut is drawn, and so is a barrel at the foot of the wall");
+    Check(farLantern.drawn, "and a lantern just as high up on a house that is not in the way");
+    Check(ModelDrawn(lantern.model, false) == nullptr && ModelDrawn(lantern.model, true) == nullptr &&
+              ModelDrawn(pigeon.model, false) == nullptr,
+          "what is left out never reaches the model renderer");
+    Check(Whole(ModelDrawn(banner.model, false)) && Whole(ModelDrawn(banner.model, true)) &&
+              Whole(ModelDrawn(barrel.model, false)),
+          "what is drawn of the house's scenery is drawn whole, in both of the model renderer's lists");
+    Check(Whole(ModelDrawn(lampPost.model, false)) && Whole(ModelDrawn(lampPost.model, true)) &&
+              Whole(ModelDrawn(passerBy.model, false)) && Whole(ModelDrawn(farLantern.model, false)),
+          "the lamp post and the passer-by down the street are whole");
+    Check(Whole(ModelDrawn(g_treeModel, false)) && Whole(ModelDrawn(g_treeModel, true)),
+          "and so is a tree, which nobody was asked about");
+    int withPlane = 0;
+    for (int i = 0; i < g_groupDrawCount && i < kMaxGroupDraws; ++i) {
+        withPlane += WithPlane(&g_groupDraws[i].draw) ? 1 : 0;
+    }
+    CheckEqual(withPlane, 1 + 7, "eight groups in all are drawn with the plane: the shell, six rooms and the porch");
+    int modelsWithPlane = 0;
+    for (int i = 0; i < g_modelDrawCount && i < static_cast<int>(2 * kMockElements); ++i) {
+        modelsWithPlane += WithPlane(&g_modelDraws[i].draw) ? 1 : 0;
+    }
+    CheckEqual(modelsWithPlane, 0, "no model is drawn with the plane");
+    info = Info();
+    CheckEqual(info.draws, withPlane, "ARPG_CutawayInfo counts the eight, and no other draw had the plane");
+    Check(info.sceneryOut == 3 && info.creaturesOut == 1,
+          "and what was left out: lantern, sign and weather vane, and the pigeon");
+
+    // The lines of sight.
+    const int tests = g_groupLines.tests;
+    RenderWorldFrame();
+    Check(g_groupLines.tests > tests + 8 && Info().parts == 1,
+          "a part whose box the lines go through but whose surfaces they miss is not in the way: every group around "
+          "the character is asked about, and one is named");
+    g_surfacesFromAboveOnly = true;
+    FramesFor(1300);
+    Check(Info().parts == 1, "the same if the client's test counts a surface only from the side the line comes from");
+    g_surfacesFromAboveOnly = false;
+
+    const game::Vec3 eye = g_drawn.eye;
+    const auto pebbleOn = [&](const game::Vec3& from) {  // a small solid thing a tenth of the way to the camera
+        const game::Vec3 at = {from.x + (eye.x - from.x) * 0.1f, from.y + (eye.y - from.y) * 0.1f,
+                               from.z + (eye.z - from.z) * 0.1f};
+        return Solid{true, {{at.x - 0.05f, at.y - 0.05f, at.z - 0.05f}, {at.x + 0.05f, at.y + 0.05f, at.z + 0.05f}}};
+    };
+    const game::Vec3 lineEnds[] = {
+        {kFeet.x, kFeet.y, kFeet.z + 1.5f},         // the chest
+        {kFeet.x, kFeet.y, kFeet.z + 2.2f},         // the head
+        {kFeet.x, kFeet.y - 1.0f, kFeet.z + 1.5f},  // a yard to one side
+        {kFeet.x, kFeet.y + 1.0f, kFeet.z + 1.5f},  // and to the other
+    };
+    const char* const lineNames[] = {
+        "the always-drawn part is met as well, on the line to the chest: two parts in the way are two parts cut",
+        "on the line to the head alone: likewise",
+        "on a line a yard to one side of the character",
+        "and on the other side",
+    };
+    for (int i = 0; i < 4; ++i) {
+        g_solids[0][kAlwaysDrawn] = pebbleOn(lineEnds[i]);
+        RenderWorldFrame();
+        Check(Info().parts == 2 && WithPlane(GroupDrawn(0, kAlwaysDrawn)) && Whole(GroupDrawn(0, kCourtyard)), lineNames[i]);
+        g_solids[0][kAlwaysDrawn].present = false;
+        FramesFor(1300);
+        Check(Info().parts == 1 && Whole(GroupDrawn(0, kAlwaysDrawn)),
+              i == 0 ? "and one that is in the way no longer is whole again a moment later" : "(and gone again)");
+    }
+    g_solids[0][kAlwaysDrawn] = pebbleOn({kFeet.x, kFeet.y - 2.0f, kFeet.z + 1.5f});
+    RenderWorldFrame();
+    Check(Info().parts == 1, "two yards to the side is not in the way");
+    g_solids[0][kAlwaysDrawn].present = false;
+
+    // Something that was by the part in the way moves off.
+    game::At<game::Vec3>(pigeon.record, game::kSceneCentre) = {60.0f, 205.0f, 11.0f};
+    RenderWorldFrame();
+    Check(pigeon.drawn && Whole(ModelDrawn(pigeon.model, false)) && !lantern.drawn,
+          "the pigeon flies down into the street: from the next frame on it is drawn");
+    game::At<game::Vec3>(pigeon.record, game::kSceneCentre) = {100.0f, 205.0f, 26.0f};
+    game::At<game::Vec3>(lantern.record, game::kSceneCentre) = {95.0f, 200.0f, 20.9f};
+    RenderWorldFrame();
+    Check(lantern.drawn && !pigeon.drawn, "a lantern hung a little lower, so that it reaches below the cut, is drawn");
+    game::At<game::Vec3>(lantern.record, game::kSceneCentre) = {95.0f, 200.0f, 25.0f};
+
+    // Frames whose cut cannot be made (matrices that are not what the
+    // library takes them to be): nothing may go missing from a house that
+    // is drawn whole. Whether the cut will be made is known only after the
+    // scene has asked, so it goes by the frame before.
+    RenderWorldFrame();
+    Check(!lantern.drawn && WithPlane(GroupDrawn(0, kOuterShell)), "(the lantern is left out again, with the wall it hangs on)");
+    g_viewTransposed = true;
+    RenderWorldFrame();
+    Check(Whole(GroupDrawn(0, kOuterShell)), "a frame that cannot be cut: the house is drawn whole");
+    RenderWorldFrame();
+    Check(lantern.drawn && sign.drawn && pigeon.drawn && Whole(GroupDrawn(0, kOuterShell)),
+          "and from the next such frame on, nothing is left out of it");
+    info = Info();
+    Check(info.sceneryOut == 0 && info.creaturesOut == 0, "nor counted as left out");
+    g_viewTransposed = false;
+    RenderWorldFrame();
+    Check(WithPlane(GroupDrawn(0, kOuterShell)), "the cut can be made again");
+    RenderWorldFrame();
+    Check(!lantern.drawn && !pigeon.drawn, "and what goes with it is left out again");
+
+    // Only the always-drawn part is in the way: the rooms that touch it go
+    // with it, the room upstairs does not.
+    g_solids[0][kOuterShell].present = false;
+    g_solids[0][kAlwaysDrawn] = pebbleOn(lineEnds[0]);
+    FramesFor(1300);
+    Check(Info().parts == 1 && WithPlane(GroupDrawn(0, kAlwaysDrawn)) && Whole(GroupDrawn(0, kOuterShell)),
+          "another part in the way instead of the shell");
+    Check(Visited(0, kRoomOfCharacter, 1) && GroupDrawn(0, kRoomUpstairs) == nullptr,
+          "of the rooms only those that touch the part are queued");
+    // The hut's room, for once two storeys high, is in the way as well: the
+    // house's room upstairs touches it, but is no room of the hut.
+    const game::Box hutBox = game::At<game::Box>(g_buildings[2].placed[0], game::kPlacedGroupBounds);
+    game::At<game::Box>(g_buildings[2].placed[0], game::kPlacedGroupBounds) = {{90.0f, 190.0f, 9.0f}, {110.0f, 210.0f, 20.0f}};
+    g_solids[2][0] = pebbleOn(lineEnds[1]);
+    RenderWorldFrame();
+    Check(Info().parts == 2 && WithPlane(GroupDrawn(2, 0)) && GroupDrawn(0, kRoomUpstairs) == nullptr,
+          "a part of another building in the way too: a room goes with the parts of its own building only");
+    g_solids[2][0].present = false;
+    game::At<game::Box>(g_buildings[2].placed[0], game::kPlacedGroupBounds) = hutBox;
+    g_solids[0][kAlwaysDrawn].present = false;
+    g_solids[0][kOuterShell] = kRoof;
+    FramesFor(1300);
+    Check(Info().parts == 1 && WithPlane(GroupDrawn(0, kOuterShell)), "and back");
+
+    // A bridge high over the street is in the way as well (the hut's only
+    // group, stretched for the purpose). What stands under it is not on it.
+    game::At<game::Box>(g_buildings[2].placed[0], game::kPlacedGroupBounds) = {{60.0f, 190.0f, 26.0f}, {96.0f, 210.0f, 28.0f}};
+    const float upTheLine = (27.0f - lineEnds[0].z) / (eye.z - lineEnds[0].z);
+    const game::Vec3 onTheLine = {lineEnds[0].x + (eye.x - lineEnds[0].x) * upTheLine,
+                                  lineEnds[0].y + (eye.y - lineEnds[0].y) * upTheLine, 27.0f};
+    g_solids[2][0] = {true, {{onTheLine.x - 0.05f, onTheLine.y - 0.05f, 26.95f}, {onTheLine.x + 0.05f, onTheLine.y + 0.05f, 27.05f}}};
+    MockPiece& poleLamp = PutPiece(11, false, 0, kAlwaysDrawn, {70.0f, 200.0f, 22.5f});
+    RenderWorldFrame();
+    Check(upTheLine > 0.0f && upTheLine < 1.0f && Info().parts == 2 && WithPlane(GroupDrawn(2, 0)),
+          "a bridge high over the street is in the way as well");
+    Check(poleLamp.drawn && !lantern.drawn,
+          "a lamp on a pole under the bridge, above the cut, is not on the bridge: it is drawn");
+    game::At<game::Vec3>(poleLamp.record, game::kSceneCentre) = {70.0f, 200.0f, 31.0f};
+    RenderWorldFrame();
+    Check(!poleLamp.drawn, "set on top of the bridge, it goes with the bridge");
+    poleLamp.present = false;
+    g_solids[2][0].present = false;
+    game::At<game::Box>(g_buildings[2].placed[0], game::kPlacedGroupBounds) = hutBox;
+    FramesFor(1300);
+    Check(Info().parts == 1 && Whole(GroupDrawn(2, 0)), "and back again");
+
+    // The shell stops being met (the character has moved on) while something
+    // else, which no group answers for, is still in the way.
+    g_solids[0][kOuterShell].present = false;
+    RenderWorldFrame();
+    Check(Info().parts == 1 && WithPlane(GroupDrawn(0, kOuterShell)),
+          "a part stays cut for a moment after it was last in the way");
+    FramesFor(1300);
+    info = Info();
+    Check(info.cutting && info.parts == -1, "with the view blocked and no part to name, the cut is for everything");
+    Check(Cut() && !Drawn(roof) && WithPlane(GroupDrawn(0, kAlwaysDrawn)) && WithPlane(GroupDrawn(0, kCourtyard)) &&
+              WithPlane(ModelDrawn(g_treeModel, false)),
+          "as it was before pieces could be told apart");
+    Check(lantern.drawn && WithPlane(ModelDrawn(lantern.model, false)) && info.sceneryOut == 0 && info.creaturesOut == 0,
+          "and nothing is left out: the lantern is drawn and cut like everything else");
+    CheckEqual(g_visitCount, 5 + 8, "and every room in view is queued again, the hut's too");
+    g_solids[0][kOuterShell] = kRoof;
+    Fixed<int32_t>(game::kQueuedGroupsLinkOffset) = 0x40;
+    RenderWorldFrame();
+    CheckEqual(Info().parts, -1, "a list of groups that is not laid out as it was read is not walked");
+    Fixed<int32_t>(game::kQueuedGroupsLinkOffset) = static_cast<int32_t>(game::kPlacedGroupQueued - sizeof(void*));
+    RenderWorldFrame();
+    Check(Info().parts == 1 && !Cut() && Whole(GroupDrawn(0, kAlwaysDrawn)),
+          "a part is named again: back to that part alone");
+
+    // The view clears while everything is cut: that cut winds down as it
+    // always did.
+    g_solids[0][kOuterShell].present = false;
+    FramesFor(1300);
+    g_slabs[0].present = false;
+    FramesFor(200);
+    info = Info();
+    Check(info.cutting && info.parts == -1 && Cut(), "the view clears while everything is cut: it stays a moment, for everything");
+    FramesFor(600);
+    info = SettleFrames();
+    Check(!info.cutting && !Cut(), "and then slides away");
+
+    // And while only a part is.
+    g_slabs[0] = {true, 20.0f, 21.0f, kEverywhere};
+    g_solids[0][kOuterShell] = kRoof;
+    FramesFor(300);
+    info = SettleFrames();
+    Check(info.cutting && info.parts == 1 && !Cut(), "blocked again, with a part to name from the start: that part alone");
+    g_slabs[0].present = false;
+    g_solids[0][kOuterShell].present = false;
+    FramesFor(200);
+    info = Info();
+    Check(info.cutting && info.parts == 1 && WithPlane(GroupDrawn(0, kOuterShell)) && !Cut(),
+          "the view clears: the cut stays a moment, still for the part that was in the way");
+    Check(!lantern.drawn && banner.drawn, "and what stands on it wholly above the cut is still left out");
+    FramesFor(600);
+    info = SettleFrames();
+    Check(!info.cutting && !Cut() && Whole(GroupDrawn(0, kOuterShell)) && Whole(ModelDrawn(lantern.model, false)),
+          "and then slides away");
+    Check(pigeon.drawn && vane.drawn && info.sceneryOut == 0 && info.creaturesOut == 0,
+          "with everything on the house drawn again");
+
+    // A lower roof, and something on it within reach of the character.
+    const Solid kLowRoof = {true, {{80.0f, 180.0f, 15.0f}, {120.0f, 220.0f, 16.0f}}};
+    g_slabs[0] = {true, 15.0f, 16.0f, kEverywhere};
+    g_solids[0][kOuterShell] = kLowRoof;
+    MockPiece& crow = PutPiece(10, true, 0, kOuterShell, {100.0f, 203.0f, 16.5f});
+    FramesFor(300);
+    info = SettleFrames();
+    CheckNear(info.height, 5.0f - 0.3f, "a porch roof 5 yards up: cut just under it");
+    Check(info.parts == 1 && !pigeon.drawn, "the pigeon on the house's roof is left out again");
+    Check(crow.drawn, "a crow on the porch roof, three yards from the character, is drawn: whatever is within reach "
+                      "of the character always is");
+    game::At<game::Vec3>(crow.record, game::kSceneCentre) = {100.0f, 209.0f, 16.5f};
+    RenderWorldFrame();
+    Check(!crow.drawn, "nine yards off it goes with the roof it sits on");
+    game::At<game::Vec3>(lampPost.record, game::kSceneCentre) = {100.0f, 203.0f, 16.5f};
+    RenderWorldFrame();
+    Check(!lampPost.drawn, "scenery is not kept for being near the character");
+    g_slabs[0].present = false;
+    g_solids[0][kOuterShell].present = false;
+    FramesFor(1500);
+    SettleFrames();
+
+    g_outdoorGroupCount = 0;
+    ClearPieces();
     SetCutaway(kCutHeight);
 }
 
@@ -3811,6 +4710,211 @@ void TestInsideView() {
     SetCutaway(kCutHeight);
 }
 
+void TestOutsideObjects() {
+    Section("inside view: scenery and creatures that stand outside the rooms shown");
+    void* const house = g_buildings[0].building;
+    SetCamera(0.0, 60.0, 22.0);
+    g_playerPosition = kFeet;
+    g_outdoors = false;
+    g_characterRoom = {house, kRoomOfCharacter};
+    g_cameraStandsIn = {nullptr, 0};
+    g_slabs[0] = {true, 15.0f, 16.0f, kEverywhere};
+    g_slabs[1].present = false;
+    g_outdoorGroupCount = 0;
+    // What is under a point: the character's room from x 90 to 110, and the
+    // far wing, a room that is out of view and so not shown, from 130 to 140.
+    for (LookupRoom& room : g_lookupRooms) {
+        room.present = false;
+    }
+    g_lookupRooms[0] = {true, 90.0f, 110.0f, 10.0f, 16.0f, house, kRoomOfCharacter, false};
+    g_lookupRooms[1] = {true, 130.0f, 140.0f, 10.0f, 16.0f, house, kFarWing, false};
+    // All of these the game files under the character's room: its box takes
+    // them in.
+    ClearPieces();
+    MockPiece& chair = PutPiece(0, false, 0, kRoomOfCharacter, {104.0f, 203.0f, 10.5f});
+    MockPiece& lamp = PutPiece(1, false, 0, kRoomOfCharacter, {85.0f, 200.0f, 12.0f});     // outside the wall
+    lamp.also = static_cast<int>(kPastFarWing);  // and filed under a second room that is shown
+    MockPiece& crate = PutPiece(2, false, 0, kRoomOfCharacter, {135.0f, 200.0f, 11.0f});   // in the far wing
+    MockPiece& unseen = PutPiece(3, false, 0, kRoomOfCharacter, {105.0f, 205.0f, 11.0f});  // in the room, out of view
+    unseen.inView = false;
+    MockPiece& cat = PutPiece(4, true, 0, kRoomOfCharacter, {108.0f, 207.0f, 10.5f});      // across the room
+    MockPiece& passerBy = PutPiece(5, true, 0, kRoomOfCharacter, {85.0f, 205.0f, 11.0f});  // in the street
+    MockPiece& pet = PutPiece(6, true, 0, kRoomOfCharacter, {101.0f, 201.0f, 11.0f});      // at the character's heel
+    MockPiece& foe = PutPiece(7, true, 0, kRoomOfCharacter, {93.0f, 200.0f, 11.0f});       // within reach of a blow
+    MockPiece& ghost = PutPiece(8, true, 0, kRoomOfCharacter, {109.0f, 208.0f, 11.0f});    // across the room, out of view
+    ghost.inView = false;
+    MockPiece& rat = PutPiece(9, true, 0, kRoomOfCharacter, {135.0f, 205.0f, 11.0f});      // in the far wing
+    SetCutaway(kCutHeight);
+    g_inViewCalls = {};
+    g_lookups = {};
+    g_terrainCalls = {};
+    RenderWorldFrame();
+    Check(Info().inside, "the character is in a room, shown from inside");
+    Check(chair.drawn && chair.answer == kInView,
+          "a chair in the room is drawn, and the client gets its own test's answer back");
+    Check(!lamp.drawn && lamp.answer == 0, "a lamp outside the wall is not: for the client it is out of view");
+    Check(!crate.drawn, "nor is a crate in a room that is not shown");
+    Check(!unseen.drawn && unseen.asked == 1, "what the client's own test says is out of view stays out");
+    Check(cat.drawn && !passerBy.drawn, "a cat across the room is drawn, someone walking by in the street is not");
+    Check(!rat.drawn && !ghost.drawn, "nor is a rat in the room that is not shown, nor what the client's test leaves out");
+    Check(pet.drawn && foe.drawn, "the character's own company is drawn, and whoever is within reach of a blow");
+    Check(g_inViewCalls.wrong == 0 && g_inViewCalls.count == 11 && lamp.asked == 2,
+          "the client's test is made of each as the client makes it: once, and of the lamp once for each of its rooms");
+    CheckEqual(g_lookups.count - g_lookups.upward, 1 + 3 + 3,
+               "what is under each is asked once: of the three pieces of scenery in view and of the three creatures "
+               "in view beyond the character's reach");
+    Check(g_lookups.slanted == 0 && g_lookups.fractionNotOne == 0 && g_terrainCalls.wrong == 0 &&
+              g_terrainCalls.count == g_lookups.count - g_lookups.upward,
+          "the way the character's own room is asked for: straight down, the terrain first");
+    CheckEqual(g_lookups.upward, 2,
+               "and what is over it only of the two with nothing under them, the lamp and the passer-by");
+    CutawayInfo info = Info();
+    Check(info.sceneryOut == 2 && info.creaturesOut == 2, "ARPG_CutawayInfo: two pieces of scenery and two creatures left out");
+    Check(ModelDrawn(chair.model, false) != nullptr && ModelDrawn(lamp.model, false) == nullptr &&
+              ModelDrawn(passerBy.model, false) == nullptr,
+          "the model renderer gets what is in the rooms and nothing else");
+
+    g_lookups = {};
+    RenderWorldFrame();
+    CheckEqual(g_lookups.count - g_lookups.upward, 1 + 3,
+               "scenery stays where it is: the next frame asks only about the creatures");
+    Check(chair.drawn && !lamp.drawn && !crate.drawn, "with the same result");
+    info = Info();
+    Check(info.sceneryOut == 2 && info.creaturesOut == 2, "and the same count, each piece once");
+
+    game::At<game::Vec3>(lamp.record, game::kSceneCentre) = {95.0f, 200.0f, 12.0f};
+    g_lookups = {};
+    RenderWorldFrame();
+    Check(lamp.drawn && g_lookups.count - g_lookups.upward == 1 + 3 + 1,
+          "a piece found somewhere else than it was is another piece: it is asked about afresh");
+    game::At<game::Vec3>(lamp.record, game::kSceneCentre) = {85.0f, 200.0f, 12.0f};
+    RenderWorldFrame();
+    Check(!lamp.drawn, "and once more when it is back outside");
+
+    g_lookupRooms[2] = {true, 80.0f, 90.0f, 10.0f, 16.0f, house, kRoomOfCharacter, false};  // a floor turns up there
+    RenderWorldFrame();
+    Check(!lamp.drawn && passerBy.drawn, "the floor under a piece found outside may only not have been loaded yet: a "
+                                         "creature is asked about every frame");
+    g_lookups = {};
+    for (int i = 0; i < 125; ++i) {
+        RenderWorldFrame();
+    }
+    Check(lamp.drawn, "and scenery found in no room, again after a while");
+    CheckEqual(g_lookups.count, 125 * (1 + 3) + 1,
+               "the lamp alone: scenery that was found in a room, shown or not, is not asked about again");
+    g_lookupRooms[2].present = false;
+
+    // Out of reach of the lookup: the character's company is not asked about.
+    g_lookupRooms[0].present = false;
+    RenderWorldFrame();
+    Check(chair.drawn && !cat.drawn && pet.drawn && foe.drawn,
+          "with nothing found under anything any more: the chair is remembered, the cat is taken for outside, and "
+          "what is within eight yards of the character is drawn unasked");
+    game::At<game::Vec3>(foe.record, game::kSceneCentre) = {91.5f, 200.0f, 11.0f};
+    RenderWorldFrame();
+    Check(!foe.drawn, "half a yard further off it is asked about like the rest");
+    game::At<game::Vec3>(foe.record, game::kSceneCentre) = {100.0f, 200.0f, 19.5f};
+    RenderWorldFrame();
+    Check(!foe.drawn, "and so is something right overhead but a storey up");
+    g_lookupRooms[0].present = true;
+
+    // Not in the inside view: nothing is asked and nothing left out.
+    g_characterRoom = {nullptr, 0};
+    g_outdoors = true;
+    g_slabs[0].present = false;
+    g_outdoorGroups[0] = {0, kRoomOfCharacter};  // (so that the group the pieces are filed under is gone through)
+    g_outdoorGroupCount = 1;
+    SettleFrames();
+    g_lookups = {};
+    RenderWorldFrame();
+    Check(!Info().inside && chair.drawn && lamp.drawn && crate.drawn && passerBy.drawn && !unseen.drawn,
+          "outside the inside view everything the client's test shows is drawn");
+    CheckEqual(g_lookups.count, 1, "and nobody is asked where it stands");
+    info = Info();
+    Check(info.sceneryOut == 0 && info.creaturesOut == 0, "nothing is counted as left out");
+
+    g_outdoorGroupCount = 0;
+    ClearPieces();
+    for (LookupRoom& room : g_lookupRooms) {
+        room.present = false;
+    }
+}
+
+// The lookup under a piece, where its centre alone would give the wrong
+// answer: on the floor or in it, high over it, over terrain, under things.
+void TestWhereAPieceStands() {
+    Section("inside view: where scenery and creatures stand, the awkward cases");
+    void* const house = g_buildings[0].building;
+    SetCamera(0.0, 60.0, 22.0);
+    g_playerPosition = kFeet;
+    g_outdoors = false;
+    g_characterRoom = {house, kRoomOfCharacter};
+    g_cameraStandsIn = {nullptr, 0};
+    g_slabs[0] = {true, 15.0f, 16.0f, kEverywhere};
+    g_slabs[1].present = false;
+    g_outdoorGroupCount = 0;
+    for (LookupRoom& room : g_lookupRooms) {
+        room.present = false;
+    }
+    // The character's room from x 90 to 110, its floor at 10. Under its
+    // north end a cellar that is not shown.
+    g_lookupRooms[0] = {true, 90.0f, 110.0f, 10.0f, 16.0f, house, kRoomOfCharacter, false};
+    g_lookupRooms[1] = {true, 106.0f, 110.0f, 0.0f, 8.0f, house, kFarWing, false};
+    // North of it the room goes on as a hall with no ceiling within reach,
+    // and then over bare terrain: a ceiling with a roof on it, and nothing
+    // underfoot.
+    g_lookupRooms[2] = {true, 112.0f, 120.0f, 10.0f, 1000.0f, house, kRoomOfCharacter, false};
+    g_lookupRooms[3] = {true, 121.0f, 125.0f, 16.0f, 16.5f, house, kRoomOfCharacter, true};
+    // South of it, outside: the eaves of the outer shell over bare ground; a
+    // room that is not shown, jutting out over bare ground; and a courtyard
+    // with a room that is shown jutting out over it.
+    g_lookupRooms[4] = {true, 80.0f, 89.0f, 14.0f, 14.5f, house, kOuterShell, false};
+    g_lookupRooms[5] = {true, 70.0f, 79.0f, 14.0f, 20.0f, house, kFarWing, false};
+    g_lookupRooms[6] = {true, 60.0f, 69.0f, 9.0f, 10.0f, house, kCourtyard, false};
+    g_lookupRooms[7] = {true, 60.0f, 69.0f, 14.0f, 20.0f, house, kRoomOfCharacter, false};
+    ClearPieces();
+    MockPiece& rug = PutPiece(0, false, 0, kRoomOfCharacter, {107.0f, 203.0f, 9.8f});     // a little sunk into the floor
+    MockPiece& puddle = PutPiece(1, true, 0, kRoomOfCharacter, {108.0f, 208.0f, 10.0f});  // lying exactly on it
+    MockPiece& bat = PutPiece(2, true, 0, kRoomOfCharacter, {115.0f, 200.0f, 150.0f});    // high up in the hall
+    MockPiece& goat = PutPiece(3, true, 0, kRoomOfCharacter, {123.0f, 200.0f, 10.5f});    // on the bare terrain inside
+    MockPiece& sparrow = PutPiece(4, true, 0, kRoomOfCharacter, {85.0f, 205.0f, 11.0f});  // under the eaves
+    MockPiece& mouse = PutPiece(5, true, 0, kRoomOfCharacter, {75.0f, 200.0f, 11.0f});    // under the room not shown
+    MockPiece& dog = PutPiece(6, true, 0, kRoomOfCharacter, {65.0f, 200.0f, 10.5f});      // in the courtyard
+    SetCutaway(kCutHeight);
+    g_lookups = {};
+    g_terrainCalls = {};
+    RenderWorldFrame();
+    Check(Info().inside, "the character is in a room, shown from inside");
+    Check(rug.drawn, "a rug that lies a little sunk into the floor is on that floor, not in the cellar under it");
+    Check(puddle.drawn, "and so is what lies exactly on it");
+    Check(bat.drawn, "what flies a hundred and forty yards up in a hall is in that hall");
+    Check(goat.drawn, "where the floor is the terrain itself, the ceiling overhead says which room it is");
+    Check(!sparrow.drawn, "outside under the eaves, what is overhead is no room");
+    Check(!mouse.drawn, "nor does a room that is not shown make it one");
+    Check(!dog.drawn, "in a courtyard the courtyard settles it, whatever room juts out overhead");
+    CheckEqual(g_lookups.count - g_lookups.upward, 1 + 7, "each is asked about once, straight down");
+    CheckEqual(g_lookups.upward, 3, "and straight up only where nothing was found below: goat, sparrow and mouse");
+    Check(g_lookups.slanted == 0 && g_lookups.fractionNotOne == 0 && g_terrainCalls.wrong == 0 &&
+              g_terrainCalls.count == g_lookups.count - g_lookups.upward,
+          "the terrain first each time, and only on the way down");
+    const CutawayInfo info = Info();
+    Check(info.sceneryOut == 0 && info.creaturesOut == 3, "ARPG_CutawayInfo: three creatures left out, no scenery");
+
+    game::At<game::Vec3>(goat.record, game::kSceneCentre) = {123.0f, 200.0f, 19.0f};
+    RenderWorldFrame();
+    Check(!goat.drawn, "up on the roof over that ceiling, it is outside");
+
+    // As the tests after this one expect to find things: out of doors.
+    g_characterRoom = {nullptr, 0};
+    g_outdoors = true;
+    g_slabs[0].present = false;
+    ClearPieces();
+    for (LookupRoom& room : g_lookupRooms) {
+        room.present = false;
+    }
+    SettleFrames();
+}
+
 void TestCutawayRefusals() {
     Section("cutaway: matrices and devices that are not what the library knows");
     g_outdoors = false;
@@ -3980,8 +5084,11 @@ int MockMain() {
     TestCutawayCursor();
     TestCutawayMoving();
     TestCutawayOutdoors();
+    TestOnlyWhatIsInTheWay();
     TestCutawayTallRooms();
     TestInsideView();
+    TestOutsideObjects();
+    TestWhereAPieceStands();
     TestCutawayRefusals();
     TestUiReload();
 

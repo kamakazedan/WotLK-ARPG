@@ -32,6 +32,10 @@
 //      to black, and its depth not to the far end of the view but to just
 //      behind the rooms, so that whatever fogs the picture by depth
 //      afterwards finds a dark wall there and not a sky to fill with fog.
+//      Scenery and creatures are filed under a room by its box, which
+//      reaches past its walls: the lamp outside the door and whoever walks
+//      by in the street come with it. Each piece is asked where it stands,
+//      the way the character was, and left out unless that is a room shown.
 //   4. The cut. Beams, galleries and the floor of the storey above are solid
 //      and face the camera. Everything above a level plane over the
 //      character's feet is clipped away while the world is drawn: the plane
@@ -50,7 +54,7 @@
 // and leave the character out. The scene is then drawn as from outdoors.
 //
 // Where the client's lookup finds no room although the client's own indoors
-// test says the character is in one, and outdoors when asked: the cut alone.
+// test says the character is in one: the cut alone.
 //
 //   The world is drawn as usual and cut at the plane. Every indoor group in
 //   view is "visited", which is the client's own way of queueing a room, so
@@ -58,13 +62,30 @@
 //   whatever is taller than the cut loses its top, and buildings that are
 //   only a shell show it.
 //
+// Outdoors, when asked, while part of a building hides the character: the
+// cut, for what is in the way only.
+//
+//   The lines of sight from the camera to the character are put to each
+//   group that is about to be drawn, with the client's own test of a line
+//   against one group's surfaces. The groups they meet are in the way. Only
+//   those are cut, with the rooms inside them (which are visited, as above):
+//   the plane is on for a draw only while one of them is being drawn. The
+//   street, the terrain and the building across the road are drawn whole.
+//   Models are not cut one by one: the client draws many of a kind in a
+//   single draw. The scenery and the creatures that stand on a part in the
+//   way, wholly above the cut, are left out with what is cut away under
+//   them; whatever reaches below the cut is drawn whole. If the line of
+//   sight is blocked and no group can be named, everything is cut, as
+//   indoors.
+//
 // Where the cut is made:
 //   - Under a roof lower than the camera: at a set height over the
 //     character's feet. Under a ceiling lower than that, just under the
 //     ceiling. In a tall room, just under whatever is in the way.
 //   - Under a roof higher than the camera, seen from inside: not at all.
 //   - Under the open sky: only if asked, while part of a building stands
-//     between the camera and the character, and then just under that.
+//     between the camera and the character, and then just under that; and
+//     only that building's parts.
 // The plane slides down from the camera when a cut begins and back up when
 // it ends. In between it comes down at once and goes back up only after a
 // pause longer than a jump, so that neither jumping nor walking under a row
@@ -112,8 +133,26 @@ constexpr uint32_t kClipPlane = 5;       // which of Direct3D's six user clip pl
                                          // (the client itself uses the first)
 constexpr uint32_t kClipPlaneBit = 1u << kClipPlane;
 constexpr float kBehindRooms = 2.0f;     // yards behind the farthest corner of the rooms the background is put
+constexpr float kHead = 2.2f;            // yards over the feet: the highest line of sight tried for what is in the way
+constexpr float kBeside = 1.0f;          // yards to either side of the character the lines of sight are tried as well
+constexpr float kAround = 1.5f;          // yards around a part in the way within which scenery goes with it
+constexpr int kMaxInTheWay = 32;         // parts of buildings in the way that are kept track of
+constexpr uint32_t kInTheWayMs = 1000;   // a part stays cut this long after it was last in the way: longer than a cut
+                                         // takes to end, so that it does not come back whole under a plane still low
+constexpr int kMaxQueued = 8192;         // groups on a frame's list; ends a walk over a broken list
+constexpr float kStandingLift = 0.5f;    // yards over its centre the look under a piece of scenery or a creature
+                                         // begins: what lies flat on a floor, or stands a little sunk into it, is
+                                         // still over it
+constexpr float kStandingProbe = 300.0f; // yards straight down it goes, for what flies or hangs in the highest hall;
+                                         // and straight up, where nothing is found below
+constexpr float kOwnReach = 8.0f;        // yards around the character within which a creature is not asked about
+constexpr uint32_t kMaxProbes = 256;     // such lookups a frame; pieces beyond that are drawn unasked
+constexpr uint32_t kRecheckFrames = 120; // frames after which a piece found outside every room is asked about again
 
 bool g_installed = false;
+bool g_canFilter = false;  // the two calls that decide whether scenery and creatures are drawn are redirected too
+bool g_canChoose = false;  // ... and the one that tells which building group is being drawn
+uint32_t g_frame = 0;      // scene updates since the library was loaded; what is kept per frame is told by it
 
 struct Settings {
     bool enabled;   // indoors, the inside view
@@ -143,6 +182,11 @@ struct State {
     float blockZ;       // height of the lowest thing in the way
     bool rising;        // the plane could go up
     uint32_t risingSince;
+    bool open;          // the cut, if any, is the open-sky kind: for what is in the way only
+    bool sightNow;      // ... and this very frame something is in the line of sight
+    bool unnamed;       // ... but no part of a building could be named for it, so the cut is for everything
+                        // after all, until one can be or the cut is over
+    bool drawnCut;      // the last frame that asked for a cut was drawn with one
 
     bool givenUp;       // Direct3D does not take the cut's clip plane
     uint32_t refusals;
@@ -153,9 +197,48 @@ State g_state = {};
 struct Cut {
     bool on;                  // from just before the world is drawn until it has been
     bool sent;                // Direct3D's clip-plane switch has this library's bit in it
+    bool all;                 // every draw of the world is cut; otherwise only the building groups chosen...
+    bool piece;               // ... and this says whether the group being drawn right now is one
     game::Matrix projection;  // the hardware projection the plane was worked out for
 };
 Cut g_cut = {};
+
+// Outdoors: the parts of buildings found between the camera and the
+// character. Each is a placed group, known by its building and its number.
+struct InTheWay {
+    uint8_t* building;  // compared, and followed only in the frame it was found in
+    uint32_t group;
+    game::Box box;
+    uint32_t seen;      // tick it was last in the way
+};
+struct Way {
+    InTheWay parts[kMaxInTheWay];
+    int count;
+};
+Way g_way = {};
+
+// A set of pointers that empties itself every frame: a slot counts only if
+// it was written in the current one.
+struct Slot {
+    const void* pointer;
+    uint32_t frame;
+};
+constexpr uint32_t kLeftOutSlots = 512;  // a power of two
+constexpr uint32_t kSlotTries = 8;
+Slot g_leftOut[kLeftOutSlots];  // pieces left out this frame, to count each once
+
+// Where a piece of scenery stands, kept from frame to frame: scenery does
+// not move. `centre` tells a piece from another that has since been given
+// the same address.
+struct Standing {
+    const void* piece;
+    Vec3 centre;
+    void* building;  // null: nothing under it that is a room
+    uint32_t group;
+    uint32_t frame;  // when it was looked up
+};
+constexpr uint32_t kStandingSlots = 2048;
+Standing g_standing[kStandingSlots];
 
 // What the scene's lookup found under the character, for ARPG_CutawayInfo.
 struct Where {
@@ -184,6 +267,13 @@ struct Stats {
     uint32_t rooms;          // rooms drawn in the last frame of the inside view, or queued in the last cut one
     uint32_t doorsOut;       // in that frame of the inside view: places reached through a doorway that are not rooms
     uint32_t draws;          // draws made with the cut in the last frame that had one
+    int32_t parts;           // parts of buildings that frame cut for being in the way; -1 if it cut everything
+    uint32_t sceneryOut;     // scenery left out of the last frame: for standing outside the rooms shown, or
+                             // outdoors on a part that is cut, above the cut
+    uint32_t creaturesOut;   // creatures and objects, likewise
+    uint32_t sceneryOutNow;  // the same two, counted while a frame is put together
+    uint32_t creaturesOutNow;
+    uint32_t probes;         // lookups of where a piece stands, this frame
     bool logged[kSkipReasons];
     bool loggedRefusal;
 };
@@ -302,6 +392,8 @@ void UpdateForFrame(void* player, const Vec3& feet, const Vec3& eye, bool inRoom
         g_state.cutting = false;
         g_state.blocked = false;
         g_state.blockPending = false;
+        g_state.open = false;
+        g_state.sightNow = false;
         return;
     }
 
@@ -312,6 +404,8 @@ void UpdateForFrame(void* player, const Vec3& feet, const Vec3& eye, bool inRoom
 
     bool wanted = false;
     float target = 0.0f;
+    g_state.open = false;
+    g_state.sightNow = false;
     if (enclosed) {
         g_state.blocked = false;
         g_state.blockPending = false;
@@ -335,7 +429,9 @@ void UpdateForFrame(void* player, const Vec3& feet, const Vec3& eye, bool inRoom
         g_state.blockPending = false;
     } else {
         // Open sky (or a hall higher than the camera that the scene's
-        // lookup did not find).
+        // lookup did not find). What is cut here is only what is in the way.
+        g_state.open = true;
+        g_state.sightNow = sight && g_settings.outdoors;
         if (sight && g_settings.outdoors) {
             g_state.blockZ = sightZ;
             g_state.lastBlockedTick = now;
@@ -479,13 +575,13 @@ struct Room {
 // The client's own question, "which building group is under this point",
 // asked the way its camera lookup asks it (0x00795D40): straight down, and
 // no further than the terrain. True if the answer is a room. What was found
-// is kept for ARPG_CutawayInfo either way.
-bool RoomUnder(const Vec3& point, Room* room) {
-    g_where = {};
+// goes to `where` either way.
+bool RoomBelow(const Vec3& point, float depth, Room* room, Where* where) {
+    *where = {};
     if ((*reinterpret_cast<const uint32_t*>(game::kWorldSwitches) & game::kWorldSwitchBuildings) == 0) {
         return false;
     }
-    const Vec3 below = {point.x, point.y, point.z - game::kCameraLookupDepth};
+    const Vec3 below = {point.x, point.y, point.z - depth};
     float fraction = 1.0f;
     game::IntersectTerrain(point, below, &fraction);
     void* buildings[2] = {nullptr, nullptr};
@@ -499,15 +595,21 @@ bool RoomUnder(const Vec3& point, Room* room) {
     if (data == nullptr) {
         return false;
     }
-    g_where.found = true;
-    g_where.group = groups[0];
-    g_where.flags = At<uint32_t>(data, game::kGroupDataFlags);
-    g_where.outdoors = GroupIsOutdoors(building, model, data, &g_where.area);
-    if (g_where.outdoors || (g_where.flags & game::kGroupFlagAlwaysOutdoor) != 0) {
+    where->found = true;
+    where->group = groups[0];
+    where->flags = At<uint32_t>(data, game::kGroupDataFlags);
+    where->outdoors = GroupIsOutdoors(building, model, data, &where->area);
+    if (where->outdoors || (where->flags & game::kGroupFlagAlwaysOutdoor) != 0) {
         return false;
     }
     *room = {building, groups[0]};
     return true;
+}
+
+// The room the character is in. What was found under the character is kept
+// for ARPG_CutawayInfo.
+bool RoomUnder(const Vec3& point, Room* room) {
+    return RoomBelow(point, game::kCameraLookupDepth, room, &g_where);
 }
 
 // Outdoors the scene is drawn from wherever the camera is, as the client
@@ -544,7 +646,11 @@ using Plain = void (__cdecl*)();
 Plain g_originalLocateCamera = nullptr;
 
 void __cdecl LocateCameraHook() {
+    ++g_frame;
     ++g_stats.frames;
+    g_stats.sceneryOutNow = 0;
+    g_stats.creaturesOutNow = 0;
+    g_stats.probes = 0;
     g_state.active = false;
     g_state.interior = false;
     StopCut();  // had last frame's drawing not come to its usual end
@@ -554,8 +660,11 @@ void __cdecl LocateCameraHook() {
         g_state.indoors = false;
         g_state.blocked = false;
         g_state.blockPending = false;
+        g_state.open = false;
+        g_state.sightNow = false;
         g_state.overhead = 0.0f;
         g_state.between = 0.0f;
+        g_way.count = 0;
         g_where = {};
         g_originalLocateCamera();
         return;
@@ -585,6 +694,230 @@ void __cdecl LocateCameraHook() {
     }
 
     UpdateForFrame(player, feet, eye, inRoom);
+    if (!g_state.active || !g_state.open) {
+        g_way.count = 0;  // parts in the way belong to a cut under the open sky, and to no other
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outdoors: what is in the way
+// ---------------------------------------------------------------------------
+
+// Whether the cut is for everything this frame draws, or only for the parts
+// of buildings in the way. Outdoors it is for those parts; but with the line
+// of sight blocked and no part named, the old way is better than none.
+bool CutsEverything() {
+    return !g_canChoose || g_state.interior || !g_state.open || g_state.unnamed;
+}
+
+bool SegmentTouchesBox(const Vec3& from, const Vec3& to, const game::Box& box) {
+    const float start[3] = {from.x, from.y, from.z};
+    const float step[3] = {to.x - from.x, to.y - from.y, to.z - from.z};
+    const float low[3] = {box.low.x, box.low.y, box.low.z};
+    const float high[3] = {box.high.x, box.high.y, box.high.z};
+    float enter = 0.0f;
+    float leave = 1.0f;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (Abs(step[axis]) < 0.00001f) {
+            if (start[axis] < low[axis] || start[axis] > high[axis]) {
+                return false;
+            }
+            continue;
+        }
+        const float a = (low[axis] - start[axis]) / step[axis];
+        const float b = (high[axis] - start[axis]) / step[axis];
+        enter = Max(enter, Min(a, b));
+        leave = Min(leave, Max(a, b));
+        if (enter > leave) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool BoxesTouch(const game::Box& a, const game::Box& b) {
+    return a.low.x <= b.high.x && b.low.x <= a.high.x && a.low.y <= b.high.y && b.low.y <= a.high.y &&
+           a.low.z <= b.high.z && b.low.z <= a.high.z;
+}
+
+Vec3 ToModel(const Vec3& point, const Matrix& placement) {
+    const float (*m)[4] = placement.m;
+    return {point.x * m[0][0] + point.y * m[1][0] + point.z * m[2][0] + m[3][0],
+            point.x * m[0][1] + point.y * m[1][1] + point.z * m[2][1] + m[3][1],
+            point.x * m[0][2] + point.y * m[1][2] + point.z * m[2][2] + m[3][2]};
+}
+
+// Whether the line meets a surface of this one group: the client's own test
+// (game.h), asked the way the client asks it, with the surfaces the line of
+// sight is judged by.
+bool GroupOnLine(uint8_t* building, uint8_t* model, uint32_t index, uint8_t* data, const Vec3& from,
+                 const Vec3& to) {
+    const Matrix& placement = At<Matrix>(building, game::kBuildingPlacement);
+    const Vec3 line[2] = {ToModel(from, placement), ToModel(to, placement)};
+    if (!game::LineTouchesGroupBox(model, &line[0], &line[1], index)) {
+        return false;
+    }
+    float fraction = 1.0f;
+    uint8_t out = 0;
+    return game::LineMeetsGroup(data, line, &fraction, game::kIntersectBuildings, game::kBuildingSurfacesPassed, &out,
+                                building) &&
+           fraction >= 0.0f && fraction <= 1.0f;
+}
+
+// The placed building a placed group belongs to.
+uint8_t* BuildingOf(uint8_t* placed) {
+    const uintptr_t owner = At<uintptr_t>(placed, game::kPlacedGroupOwner);
+    return IsLink(owner) ? At<uint8_t*>(reinterpret_cast<void*>(owner), game::kOwnerBuilding) : nullptr;
+}
+
+void RememberInTheWay(uint8_t* building, uint32_t group, const game::Box& box, uint32_t now) {
+    int slot = -1;
+    for (int i = 0; i < g_way.count; ++i) {
+        if (g_way.parts[i].building == building && g_way.parts[i].group == group) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (g_way.count < kMaxInTheWay) {
+            slot = g_way.count++;
+        } else {
+            slot = 0;  // full: the one longest out of the way makes room
+            for (int i = 1; i < g_way.count; ++i) {
+                if (now - g_way.parts[i].seen > now - g_way.parts[slot].seen) {
+                    slot = i;
+                }
+            }
+        }
+    }
+    g_way.parts[slot] = {building, group, box, now};
+}
+
+// Goes through the groups this frame is about to draw for the ones a line of
+// sight from the camera to the character meets. Lines to the chest, the head
+// and a yard to either side: what hides the ground next to the character
+// hides the character a step later.
+void FindWhatIsInTheWay() {
+    const uint32_t now = g_state.lastTick;
+    int kept = 0;
+    for (int i = 0; i < g_way.count; ++i) {
+        if (now - g_way.parts[i].seen <= kInTheWayMs) {
+            g_way.parts[kept++] = g_way.parts[i];
+        }
+    }
+    g_way.count = kept;
+    if (!g_state.sightNow) {
+        return;
+    }
+    if (*reinterpret_cast<const int32_t*>(game::kQueuedGroupsLinkOffset) + static_cast<int32_t>(sizeof(void*)) !=
+        static_cast<int32_t>(game::kPlacedGroupQueued)) {
+        return;  // the list is not laid out as read
+    }
+
+    const Vec3& feet = g_state.feet;
+    const Vec3& eye = g_state.eye;
+    float sideX = feet.y - eye.y;
+    float sideY = eye.x - feet.x;
+    const float length = Sqrt(sideX * sideX + sideY * sideY);
+    if (length > 0.001f) {
+        sideX = sideX / length * kBeside;
+        sideY = sideY / length * kBeside;
+    } else {
+        sideX = kBeside;
+        sideY = 0.0f;
+    }
+    const Vec3 targets[] = {
+        {feet.x, feet.y, feet.z + kChest},
+        {feet.x, feet.y, feet.z + kHead},
+        {feet.x + sideX, feet.y + sideY, feet.z + kChest},
+        {feet.x - sideX, feet.y - sideY, feet.z + kChest},
+    };
+
+    uintptr_t next = *reinterpret_cast<const uintptr_t*>(game::kQueuedGroupsHead);
+    for (int guard = 0; IsLink(next) && guard < kMaxQueued; ++guard) {
+        uint8_t* placed = reinterpret_cast<uint8_t*>(next);
+        next = At<uintptr_t>(placed, game::kPlacedGroupQueued);
+        const game::Box& box = At<game::Box>(placed, game::kPlacedGroupBounds);
+        uint8_t* building = BuildingOf(placed);
+        uint8_t* model = building != nullptr ? ReadyModel(building) : nullptr;
+        if (model == nullptr) {
+            continue;
+        }
+        const uint32_t index = At<uint32_t>(placed, game::kPlacedGroupIndex);
+        uint8_t* data = ReadyGroup(building, model, index);
+        if (data == nullptr || PlacedGroupAt(building, index) != placed) {
+            continue;
+        }
+        for (const Vec3& target : targets) {
+            // Both ways, as the line of sight itself is tried.
+            if (SegmentTouchesBox(target, eye, box) && (GroupOnLine(building, model, index, data, target, eye) ||
+                                                         GroupOnLine(building, model, index, data, eye, target))) {
+                RememberInTheWay(building, index, box, now);
+                break;
+            }
+        }
+    }
+}
+
+bool IsInTheWay(const uint8_t* building, uint32_t group) {
+    for (int i = 0; i < g_way.count; ++i) {
+        if (g_way.parts[i].building == building && g_way.parts[i].group == group) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool HasPartInTheWay(const uint8_t* building) {
+    for (int i = 0; i < g_way.count; ++i) {
+        if (g_way.parts[i].building == building) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A room goes with a part in the way if it is of the same building and their
+// boxes touch: the rooms inside a house whose shell is being cut.
+bool TouchesPartInTheWay(const uint8_t* building, const game::Box& box) {
+    for (int i = 0; i < g_way.count; ++i) {
+        if (g_way.parts[i].building == building && BoxesTouch(g_way.parts[i].box, box)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Scenery and creatures go with a part in the way if they stand in its box,
+// right by it or anywhere over it: the sign over the door, the lantern on
+// the wall, the chimney on the roof and the flag on the chimney.
+bool StandsByPartInTheWay(const Vec3& point) {
+    for (int i = 0; i < g_way.count; ++i) {
+        const game::Box& box = g_way.parts[i].box;
+        if (point.x >= box.low.x - kAround && point.x <= box.high.x + kAround && point.y >= box.low.y - kAround &&
+            point.y <= box.high.y + kAround && point.z >= box.low.z - kAround) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Adds to a set that empties itself every frame. True if the pointer was not
+// in it yet. A set that is full where the pointer belongs does not take it.
+bool AddThisFrame(Slot* slots, uint32_t count, const void* pointer) {
+    const uint32_t frame = g_frame;
+    const uint32_t first = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pointer) >> 4);
+    for (uint32_t i = 0; i < kSlotTries; ++i) {
+        Slot& slot = slots[(first + i) & (count - 1)];
+        if (slot.frame != frame) {
+            slot = {pointer, frame};
+            return true;
+        }
+        if (slot.pointer == pointer) {
+            return false;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -593,9 +926,10 @@ void __cdecl LocateCameraHook() {
 
 constexpr int kMaxBuildings = 4096;  // far more than a scene holds; ends a walk over a broken list
 
-// The cut alone: every indoor group of a building that is under the cut and
-// in view.
-void ShowRoomsOf(uint8_t* building) {
+// The cut without the inside view: every indoor group of a building that is
+// under the cut and in view; where only what is in the way is cut, only the
+// rooms that go with that.
+void ShowRoomsOf(uint8_t* building, bool everything) {
     uint8_t* model = ReadyModel(building);
     if (model == nullptr) {
         return;
@@ -633,6 +967,9 @@ void ShowRoomsOf(uint8_t* building) {
         if (box.low.z >= g_state.planeZ || game::BoxOutsideView(&box)) {
             continue;  // wholly above the cut, or off screen
         }
+        if (!everything && !TouchesPartInTheWay(building, box)) {
+            continue;  // inside a building that stays whole
+        }
         *reinterpret_cast<uint32_t*>(game::kSceneInteriorPath) = (flags & game::kGroupFlagOutdoorLit) != 0 ? 0 : 1;
         game::VisitBuildingGroup(index, building);
         ++g_stats.rooms;
@@ -645,12 +982,18 @@ void ShowRooms() {
         return;  // not the whole-screen view this is meant to run under
     }
     const uint32_t interiorPath = *reinterpret_cast<const uint32_t*>(game::kSceneInteriorPath);
+    const bool everything = CutsEverything();
+    if (!everything && g_way.count == 0) {
+        return;
+    }
     const int32_t linkOffset = *reinterpret_cast<const int32_t*>(game::kPlacedBuildingsLinkOffset);
     uintptr_t building = *reinterpret_cast<const uintptr_t*>(game::kPlacedBuildingsHead);
     for (int guard = 0; IsLink(building) && guard < kMaxBuildings; ++guard) {
         uint8_t* current = reinterpret_cast<uint8_t*>(building);
         building = At<uintptr_t>(current, static_cast<size_t>(linkOffset) + sizeof(void*));
-        ShowRoomsOf(current);
+        if (everything || HasPartInTheWay(current)) {
+            ShowRoomsOf(current, everything);
+        }
     }
     *reinterpret_cast<uint32_t*>(game::kSceneInteriorPath) = interiorPath;
 }
@@ -749,9 +1092,149 @@ Plain g_originalFinishVisits = nullptr;
 
 void __cdecl FinishVisitsHook() {
     if (g_state.active && !g_state.interior) {
+        if (g_state.open && g_canChoose) {
+            FindWhatIsInTheWay();
+            if (g_way.count != 0) {
+                g_state.unnamed = false;
+            } else if (g_state.sightNow) {
+                g_state.unnamed = true;
+            }
+        }
         ShowRooms();
     }
     g_originalFinishVisits();
+    g_stats.sceneryOut = g_stats.sceneryOutNow;
+    g_stats.creaturesOut = g_stats.creaturesOutNow;
+}
+
+// ---------------------------------------------------------------------------
+// Scenery and creatures
+// ---------------------------------------------------------------------------
+
+bool IsDrawnRoom(void* building, uint32_t group);
+bool RoomOnLine(const Vec3& from, const Vec3& to, void** building, uint32_t* group);
+
+// The room a piece of scenery or a creature stands in. What is under it is
+// asked the way the character's own room was: the terrain, then the nearest
+// building surface above that. Where there is none, the floor is the terrain
+// itself or the piece is set into the floor, and the nearest surface over it
+// says where it is: a ceiling, or the floor it is set into. A street or a
+// roof under it settles it: that is not a room, whatever is overhead.
+bool StandsIn(const Vec3& centre, Room* room) {
+    const Vec3 from = {centre.x, centre.y, centre.z + kStandingLift};
+    Where where = {};
+    if (RoomBelow(from, kStandingProbe, room, &where)) {
+        return true;
+    }
+    if (where.found) {
+        return false;
+    }
+    const Vec3 above = {from.x, from.y, from.z + kStandingProbe};
+    void* building = nullptr;
+    uint32_t group = 0;
+    if (!RoomOnLine(from, above, &building, &group)) {
+        return false;
+    }
+    *room = {static_cast<uint8_t*>(building), group};
+    return true;
+}
+
+// Whether a point is in one of the rooms the inside view is showing.
+bool InShownRoom(const Vec3& point) {
+    Room room = {};
+    return StandsIn(point, &room) && IsDrawnRoom(room.building, room.group);
+}
+
+// The same for a piece of scenery, which stays where it is: the room it
+// stands in is looked up once and kept. One found in no room is asked about
+// again after a while, in case the floor under it had not been loaded yet.
+bool SceneryInShownRoom(const uint8_t* piece, const Vec3& centre) {
+    Standing& kept = g_standing[(reinterpret_cast<uintptr_t>(piece) >> 4) & (kStandingSlots - 1)];
+    const bool same = kept.piece == piece && kept.centre.x == centre.x && kept.centre.y == centre.y &&
+                      kept.centre.z == centre.z;
+    if (!same || (kept.building == nullptr && g_frame - kept.frame >= kRecheckFrames)) {
+        if (g_stats.probes >= kMaxProbes) {
+            return true;
+        }
+        ++g_stats.probes;
+        Room room = {};
+        const bool found = StandsIn(centre, &room);
+        kept = {piece, centre, found ? room.building : nullptr, found ? room.group : 0, g_frame};
+    }
+    return kept.building != nullptr && IsDrawnRoom(kept.building, kept.group);
+}
+
+// Whatever is within reach of the character is always drawn: the character
+// itself, its mount and its pet; and whoever stands close enough to hit it,
+// which nobody wants to be invisible for standing on a doorstep that counts
+// as outdoors, or on a ledge above the cut.
+bool WithinReach(const Vec3& centre) {
+    const Vec3& feet = g_state.feet;
+    const float aside = (centre.x - feet.x) * (centre.x - feet.x) + (centre.y - feet.y) * (centre.y - feet.y);
+    return aside <= kOwnReach * kOwnReach && Abs(centre.z - feet.z) <= kOwnReach;
+}
+
+// Creatures move, and there are few of them: each is asked about every
+// frame.
+bool CreatureInShownRoom(const Vec3& centre) {
+    if (g_stats.probes >= kMaxProbes) {
+        return true;
+    }
+    ++g_stats.probes;
+    return InShownRoom(centre);
+}
+
+// Outdoors, with only the parts in the way cut: whether a piece goes with
+// what is cut away. A model cannot be cut by itself, because the client
+// draws many of a kind in a single draw (0x00820AE0) and the plane is on or
+// off for all of it. So what stands on or by a part in the way and wholly
+// above the cut is left out: the sign over the door, the chimney, the
+// furniture of the storey that is gone, whoever stands up there. What
+// reaches below the cut is drawn whole, as is everything that stands
+// somewhere else. And nothing is left out unless the cut is really being
+// made: whether this frame's will be is not known yet when the scene asks
+// (the device may not be one this library draws on, or its matrices not what
+// they are taken to be), so the frame before stands in for it.
+bool GoesWithTheCut(const Vec3& centre, float radius) {
+    return g_state.drawnCut && g_way.count != 0 && centre.z - radius > g_state.planeZ &&
+           StandsByPartInTheWay(centre);
+}
+
+// A piece of scenery or a creature shows in the view of a group being gone
+// through for what is in it. Whether it is drawn: in the inside view, only
+// if it stands in a room that is shown; outdoors, unless it goes with what
+// is cut away.
+bool KeepPiece(const Vec3* centre, float radius, bool scenery) {
+    if (!g_canFilter) {
+        return true;
+    }
+    const uint8_t* piece = reinterpret_cast<const uint8_t*>(centre) - game::kSceneCentre;
+    bool keep = true;
+    if (!scenery && WithinReach(*centre)) {
+        keep = true;
+    } else if (g_state.interior) {
+        keep = scenery ? SceneryInShownRoom(piece, *centre) : CreatureInShownRoom(*centre);
+    } else {
+        keep = !GoesWithTheCut(*centre, radius);
+    }
+    if (!keep && AddThisFrame(g_leftOut, kLeftOutSlots, piece)) {
+        ++(scenery ? g_stats.sceneryOutNow : g_stats.creaturesOutNow);
+    }
+    return keep;
+}
+
+using InView = int (__thiscall*)(void* view, const Vec3* centre, float radius);
+InView g_originalSceneryInView = nullptr;
+InView g_originalCreatureInView = nullptr;
+
+int __fastcall SceneryInViewHook(void* view, void* /*edx*/, const Vec3* centre, float radius) {
+    const int seen = g_originalSceneryInView(view, centre, radius);
+    return seen != 0 && !KeepPiece(centre, radius, true) ? 0 : seen;
+}
+
+int __fastcall CreatureInViewHook(void* view, void* /*edx*/, const Vec3* centre, float radius) {
+    const int seen = g_originalCreatureInView(view, centre, radius);
+    return seen != 0 && !KeepPiece(centre, radius, false) ? 0 : seen;
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +1323,7 @@ void __cdecl SceneClearHook(uint32_t what, uint32_t colour) {
 
 void Skip(SkipReason reason, int a, int b, int c) {
     ++g_stats.framesSkipped;
+    g_state.drawnCut = false;
     if (!g_stats.logged[reason]) {
         g_stats.logged[reason] = true;
         static const char* const kWhy[kSkipReasons] = {
@@ -939,6 +1423,7 @@ void StartCut() {
             logfile::Write("Cutaway: Direct3D does not take user clip plane %d. No cut.", static_cast<int>(kClipPlane));
         }
         ++g_stats.framesSkipped;
+        g_state.drawnCut = false;
         if (++g_state.refusals >= kMaxRefusals) {
             g_state.givenUp = true;
             g_state.cutting = false;
@@ -946,8 +1431,12 @@ void StartCut() {
         return;
     }
     g_cut.on = true;
+    g_state.drawnCut = true;
+    g_cut.all = CutsEverything();
+    g_cut.piece = false;
     g_cut.projection = hardware;
     g_stats.draws = 0;
+    g_stats.parts = g_cut.all ? -1 : g_way.count;
     ++g_stats.framesCut;
 }
 
@@ -971,6 +1460,8 @@ void StopCut() {
 // While the world is being drawn cut, the plane is switched on for a draw
 // that is made with a vertex shader and with the world's projection: those
 // are the draws the plane is right for. For any other it is switched off.
+// Where only the parts in the way are cut, it is on only while one of those
+// is being drawn.
 // The client's own clip planes are left as the client has them. The switch
 // is set afresh each time rather than remembered: the client sends its own
 // value whenever that changes, and another library drawing in between may
@@ -983,7 +1474,7 @@ void AfterDrawSync(uint8_t* device) {
     if (direct3d == nullptr) {
         return;
     }
-    bool cut = g_cut.on;
+    bool cut = g_cut.on && (g_cut.all || g_cut.piece);
     if (cut) {
         uint8_t* states = At<uint8_t*>(device, game::kGxDeviceStates);
         cut = states != nullptr && At<void*>(states, game::kGxStateVertexShader * game::kGxStateSize) != nullptr &&
@@ -1011,6 +1502,40 @@ void __fastcall DrawSyncHook(uint8_t* device, void* /*edx*/) {
 void __fastcall DrawSyncExHook(uint8_t* device, void* /*edx*/) {
     g_originalDrawSyncEx(device);
     AfterDrawSync(device);
+}
+
+// One group of a building is drawn. Where only the parts in the way are cut:
+// whether this is one, or a room that goes with one.
+using DrawGroup = void (__thiscall*)(uint8_t* model, uint32_t group, uint8_t* placement, void* views);
+DrawGroup g_originalDrawGroup = nullptr;
+
+// A room: by the client's own rule for indoors, as for the character's. A
+// street or a courtyard of the same model lies next to the house as well,
+// and is not to lose whatever of it is higher than the cut.
+bool GroupIsCut(uint8_t* model, uint32_t group, uint8_t* building) {
+    if (IsInTheWay(building, group)) {
+        return true;
+    }
+    if (!HasPartInTheWay(building) || ReadyModel(building) != model) {
+        return false;
+    }
+    uint8_t* data = ReadyGroup(building, model, group);
+    if (data == nullptr || (At<uint32_t>(data, game::kGroupDataFlags) & game::kGroupFlagAlwaysOutdoor) != 0) {
+        return false;
+    }
+    int32_t area = -1;
+    if (GroupIsOutdoors(building, model, data, &area)) {
+        return false;
+    }
+    const uint8_t* placed = static_cast<const uint8_t*>(PlacedGroupAt(building, group));
+    return TouchesPartInTheWay(building, Read<game::Box>(placed, game::kPlacedGroupBounds));
+}
+
+void __fastcall DrawGroupHook(uint8_t* model, void* /*edx*/, uint32_t group, uint8_t* placement, void* views) {
+    g_cut.piece = g_cut.on && !g_cut.all && model != nullptr && placement != nullptr &&
+                  GroupIsCut(model, group, placement - game::kBuildingPlacement);
+    g_originalDrawGroup(model, group, placement, views);
+    g_cut.piece = false;
 }
 
 Plain g_originalBeforeDrawing = nullptr;
@@ -1142,6 +1667,12 @@ bool Install() {
                               sizeof(game::kWorldDrawnCallBytes), 0};
     const hook::Site ray = {"Cutaway: cursor ray", game::kCursorRayCall, game::kCursorRayCallBytes,
                             sizeof(game::kCursorRayCallBytes), 0};
+    const hook::Site scenery = {"Cutaway: scenery in view", game::kSceneryInViewCall, game::kSceneryInViewCallBytes,
+                                sizeof(game::kSceneryInViewCallBytes), 0};
+    const hook::Site creatures = {"Cutaway: creatures in view", game::kCreatureInViewCall,
+                                  game::kCreatureInViewCallBytes, sizeof(game::kCreatureInViewCallBytes), 0};
+    const hook::Site group = {"Cutaway: building group drawn", game::kDrawGroupCall, game::kDrawGroupCallBytes,
+                              sizeof(game::kDrawGroupCallBytes), 0};
 
     // Each hook passes straight through while g_installed is false, so a
     // partial set does no harm; the cutaway only runs with all nine.
@@ -1165,6 +1696,28 @@ bool Install() {
     all &= hook::IsActive(hook::RedirectCall(ray, reinterpret_cast<void*>(CursorRayHook),
                                              reinterpret_cast<void**>(&g_originalCursorRay)));
     g_installed = all;
+
+    // Three more, for telling pieces apart. Without the two that see
+    // scenery and creatures, those outside the rooms shown are drawn with
+    // them; without those two or the third, which sees each building group
+    // drawn, the cut under the open sky is for everything. Either way the
+    // rest works as it did.
+    bool filter = true;
+    filter &= hook::IsActive(hook::RedirectCall(scenery, reinterpret_cast<void*>(SceneryInViewHook),
+                                                reinterpret_cast<void**>(&g_originalSceneryInView)));
+    filter &= hook::IsActive(hook::RedirectCall(creatures, reinterpret_cast<void*>(CreatureInViewHook),
+                                                reinterpret_cast<void**>(&g_originalCreatureInView)));
+    const bool choose = hook::IsActive(hook::RedirectCall(group, reinterpret_cast<void*>(DrawGroupHook),
+                                                          reinterpret_cast<void**>(&g_originalDrawGroup)));
+    g_canFilter = all && filter;
+    g_canChoose = all && filter && choose;
+    if (all && !g_canChoose) {
+        logfile::Write("Cutaway: %s", g_canFilter ? "cannot tell building groups apart as they are drawn; under the "
+                                                    "open sky the cut is for everything"
+                                                  : "cannot tell where scenery and creatures stand; they are drawn "
+                                                    "wherever the game files them, and under the open sky the cut "
+                                                    "is for everything");
+    }
     return all;
 }
 
@@ -1175,6 +1728,8 @@ void Reset() {
     g_stats = {};
     g_drawn = {};
     g_where = {};
+    g_way = {};
+    g_cut.piece = false;
 }
 
 // ARPG_SetCutaway(height [, outdoors]): while the character is in a room,
@@ -1194,7 +1749,8 @@ int __cdecl LuaSetCutaway(game::lua_State* L) {
 
 // asked, cutting, height, frames, framesCut, framesSkipped, rooms, indoors,
 // blocked, refused, overhead, between, inside, framesInside, draws, group,
-// groupFlags, area, doorsOut = ARPG_CutawayInfo()
+// groupFlags, area, doorsOut, parts, sceneryOut, creaturesOut, canChoose,
+// canFilter = ARPG_CutawayInfo()
 //   asked          1 while a cutaway is asked for
 //   cutting        1 while the world is being cut right now
 //   height         yards over the character's feet of the cut, 0 when not cutting
@@ -1215,6 +1771,13 @@ int __cdecl LuaSetCutaway(game::lua_State* L) {
 //   groupFlags     its flags from the model file, 0 if none
 //   area           the area table's flags for it (2 indoors, 4 outdoors), -1 if it has no record
 //   doorsOut       in the last frame of the inside view, places beyond a doorway that are not rooms
+//   parts          parts of buildings the last cut frame cut for being in the way; -1 if it cut everything
+//   sceneryOut     scenery left out of the last frame: in the inside view for standing outside the rooms shown,
+//                  outdoors for standing on a part that is cut, wholly above the cut
+//   creaturesOut   creatures and objects, likewise
+//   canChoose      1 if the library can cut building groups one by one (else the cut under the open sky is for
+//                  everything)
+//   canFilter      1 if it can leave out scenery and creatures that stand outside the rooms shown
 int __cdecl LuaCutawayInfo(game::lua_State* L) {
     const auto flag = [](bool value) { return value ? 1.0 : 0.0; };
     game::lua_pushnumber(L, flag(g_settings.enabled));
@@ -1236,7 +1799,12 @@ int __cdecl LuaCutawayInfo(game::lua_State* L) {
     game::lua_pushnumber(L, static_cast<double>(g_where.flags));
     game::lua_pushnumber(L, g_where.found ? static_cast<double>(g_where.area) : -1.0);
     game::lua_pushnumber(L, static_cast<double>(g_stats.doorsOut));
-    return 19;
+    game::lua_pushnumber(L, static_cast<double>(g_stats.parts));
+    game::lua_pushnumber(L, static_cast<double>(g_stats.sceneryOut));
+    game::lua_pushnumber(L, static_cast<double>(g_stats.creaturesOut));
+    game::lua_pushnumber(L, flag(g_canChoose));
+    game::lua_pushnumber(L, flag(g_canFilter));
+    return 24;
 }
 
 }  // namespace cutaway

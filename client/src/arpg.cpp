@@ -12,7 +12,7 @@
 #include "log.h"
 #include "win.h"
 
-#define ARPG_VERSION "0.5.0"
+#define ARPG_VERSION "0.6.0"
 
 namespace {
 
