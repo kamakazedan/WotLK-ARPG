@@ -26,7 +26,7 @@ echo "== library against the mock client (32-bit simulation) =="
 "$CXX" --target=i686-linux-gnu -m32 -std=c++17 -O2 -msse2 \
     -ffreestanding -fno-builtin -fno-exceptions -fno-rtti -fno-threadsafe-statics \
     -fno-stack-protector -fno-pic -fno-asynchronous-unwind-tables -fno-strict-aliasing \
-    -mstackrealign -Wall -Wextra -Werror \
+    -mstackrealign -mstack-alignment=4 -Wall -Wextra -Werror \
     '-DDLLIMPORT=extern "C"' \
     -nostdlib -static -fuse-ld=lld -Wl,--image-base=0x20000000 \
     src/*.cpp test/mock_client.cpp test/mock_platform_linux.cpp -o build/mock-client-linux

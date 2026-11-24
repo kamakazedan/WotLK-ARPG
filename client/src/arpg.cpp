@@ -12,7 +12,7 @@
 #include "log.h"
 #include "win.h"
 
-#define ARPG_VERSION "0.5.0"
+#define ARPG_VERSION "0.7.0"
 
 namespace {
 
@@ -27,6 +27,7 @@ enum Feature : uint32_t {
     kFeatureCutaway = 16,
     kFeatureInsideView = 32,  // the cutaway shows buildings from inside (0.4.0); set together with 16
     kFeatureRooms = 64,       // ... and tells rooms from streets, and reports what it found (0.5.0)
+    kFeatureOpening = 128,    // ... and outdoors makes an opening along the line of sight, no level cut (0.7.0)
 };
 uint32_t g_features = 0;
 
@@ -541,7 +542,7 @@ void Attach(void* self) {
     }
 
     if (cutaway::Install()) {
-        g_features |= kFeatureCutaway | kFeatureInsideView | kFeatureRooms;
+        g_features |= kFeatureCutaway | kFeatureInsideView | kFeatureRooms | kFeatureOpening;
     }
 
     const auto state = [](uint32_t feature) { return (g_features & feature) != 0 ? "on" : "OFF"; };

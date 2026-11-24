@@ -574,6 +574,21 @@ inline void lua_pushstring(lua_State* L, const char* value) {
 }
 
 // ---------------------------------------------------------------------------
+// What is drawn, piece by piece
+// ---------------------------------------------------------------------------
+
+// In a placed building: Matrix, world coordinates to the model's own. The
+// client passes its address along when it draws one of the building's
+// groups.
+constexpr size_t kBuildingPlacement = 0xB0;
+
+// A piece of scenery or a creature, as the scene files it under the places
+// it stands in (a placed group keeps a list of each, at +0x78 and +0x84).
+constexpr size_t kSceneModel = 0x34;   // its model, null while that is loading
+constexpr size_t kSceneCentre = 0x38;  // Vec3, world coordinates: the centre of the sphere it is tested by
+constexpr size_t kSceneRadius = 0x44;  // float
+
+// ---------------------------------------------------------------------------
 // Hook sites: address, the stock bytes that must be there, and how many of
 // them make up whole position-independent instructions.
 // tools/verify_sites.py checks each address/Bytes pair against a Wow.exe.
@@ -665,5 +680,23 @@ constexpr uint8_t kWorldDrawnCallBytes[] = {0xE8, 0x50, 0x97, 0x18, 0x00};
 // returns 0 if the cursor is not over the world.
 constexpr uintptr_t kCursorRayCall = 0x004F9EC1;
 constexpr uint8_t kCursorRayCallBytes[] = {0xE8, 0x8A, 0xC5, 0xFF, 0xFF};
+
+// In the scene's drawing of the queued groups (0x007964A0), once for each:
+// void __thiscall Model(uint32_t group, const Matrix* placement, void* views)
+// (0x007ABF50, which has no other caller), draws one group of a building.
+// `placement` is the placed building's own matrix, kBuildingPlacement into it.
+constexpr uintptr_t kDrawGroupCall = 0x007967AA;
+constexpr uint8_t kDrawGroupCallBytes[] = {0xE8, 0xA1, 0x57, 0x01, 0x00};
+
+// Where the scene goes through a visited group's scenery (0x00799B70) and
+// its creatures and objects (0x00793270), for each one:
+// int __thiscall View(const Vec3* centre, float radius) (0x00983FB0, which
+// has no other caller), nonzero if the sphere shows in that view. `centre`
+// points into the piece itself, at kSceneCentre. A piece that shows in none
+// of the group's views is not drawn.
+constexpr uintptr_t kSceneryInViewCall = 0x00799C52;
+constexpr uint8_t kSceneryInViewCallBytes[] = {0xE8, 0x59, 0xA3, 0x1E, 0x00};
+constexpr uintptr_t kCreatureInViewCall = 0x007932F2;
+constexpr uint8_t kCreatureInViewCallBytes[] = {0xE8, 0xB9, 0x0C, 0x1F, 0x00};
 
 }  // namespace game
