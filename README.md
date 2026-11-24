@@ -32,8 +32,8 @@ in from, with or without this addon, finds your settings as you left them.
 | The game's own settings as you left them on every other client | addon | fixed in 0.4.0 |
 | Indoors, the building shown from inside, looked into from above | client library | works in game since 0.5.0; with a fog mod the background comes out grey, not black |
 | Indoors, walls, beams and upper floors cut off at a set height | client library | works in game |
-| Indoors, scenery and creatures that stand outside the rooms left out | client library | new in 0.6.0; not yet run in game |
-| Outdoors, the building that hides the character cut open, and nothing else | client library | new in 0.6.0 (before: the whole screen); not yet run in game; off unless asked for |
+| Indoors, scenery and creatures that stand outside the rooms left out | client library | since 0.6.0 |
+| Outdoors, whatever of a building covers the character opened along the line of sight; what is behind or beside the character stays whole | client library | new in 0.7.0 (0.6.0 cut whole parts of a city level, and showed their insides); not yet run in game; off unless asked for |
 | A skill on the left mouse button (and the right, with WASD on): walk into range, then cast | addon + client library | next |
 | Bigger minimap; click it to walk there | addon + client library | planned |
 | Walking around obstacles, up ramps and down stairs to where you clicked | client library + server pathing | planned |
@@ -124,13 +124,16 @@ While the mode is on:
   the other at the door.
 - **Outdoors** nothing changes, unless you ask for it: with "Outdoors, open
   up the building that hides you" ticked, a roof, an archway or a wall that
-  comes between the camera and your character is cut away just under where
-  it hides you. Only the parts of the building that are in the way are cut,
-  with the rooms inside them; the signs, lanterns and chimneys that sit on
-  those parts above the cut are left out with them. Other buildings, the
-  street, the terrain and the trees stay whole. It keeps the character in
-  view under an archway or a porch roof and behind a house. A part goes
-  back to whole a second after it stops being in the way.
+  comes between the camera and your character is opened along your line of
+  sight. What is not drawn is what would cover your character on screen,
+  and a strip to either side of it and above: a slot through the building,
+  from the character's feet up, as wide as the free space beside your
+  character and at most 7 yards either way. Nothing behind your character
+  is touched, so the wall you stand in front of keeps its top; nor is what
+  stands beside it. The slot's sides and its lower edge run along your line
+  of sight, so there is no cut face to see there and no way to look into
+  the building: you see its outside, or you see past it. Signs, lanterns
+  and chimneys that sit wholly in the slot are left out with it.
 - **Scroll wheel and right mouse button**: do nothing, for now.
 
 In the options, drag a slider or roll the mouse wheel over it for single
@@ -162,15 +165,24 @@ Without the client library the addon still works: one click per move,
 - Under a porch roof or an archway that the game counts as outdoors you are
   outdoors, and the roof is drawn unless "Outdoors, open up the building
   that hides you" is ticked.
-- Outdoors a building is cut open in whole parts, as the game's files divide
-  it: a terrace of houses built as one part opens along its whole length.
-  A part comes back all at once, a second after it was last in the way.
-  Scenery on it is all or nothing: the game draws many copies of one model
-  in a single go, so one of them cannot be cut. What sits wholly above the
-  cut disappears; a banner that hangs from above the cut to below it stays,
-  in the air. And where the library cannot tell which part hides you, it
-  cuts everything on screen, as it did before 0.6.0; `/arpg status` says
-  which it is doing.
+- Outdoors the slot through a building has hard, straight edges: nothing
+  fades, and a tower in front of you gets a slot through it, not taken
+  away. Its lower edge is your line of sight to your character's feet, so
+  the ground between your character and the wall, and whoever stands
+  there, stays hidden. Its sides move in and out as you pass things that
+  stand beside you.
+- Where you stand under something (an archway, a passage through a
+  building), its far half is drawn, cut open where your character is. That
+  cut end is the one place where you can still look into a building; it is
+  not painted over. Under a roof you see only a few yards of ground ahead
+  of you through the slot.
+- Scenery in the slot is all or nothing: the game draws many copies of one
+  model in a single go, so one of them cannot be cut. What sits wholly in
+  the slot disappears; a banner that hangs out of it stays whole, in the
+  air. A creature you see in the slot on the camera's side of your
+  character cannot be clicked. Only buildings are opened: a tent or a
+  market stall, a tree and the lie of the land hide your character as
+  before.
 - A creature or an object within 8 yards of your character is drawn wherever
   it stands, also outside the wall. That includes a mailbox by the door.
 - Where the game has you indoors but cannot tell which room you stand in
@@ -237,7 +249,7 @@ indoors" option then decides what happens under a roof.
 ```
 client/build.sh       # build/WotLK-ARPG.dll and build/mock-client.exe (clang, lld; any OS)
 client/test/run.sh    # hook engine test, then the library against a mock client (Linux)
-python3 client/test/mutation_test.py            # breaks the cutaway 192 ways; the tests must notice each
+python3 client/test/mutation_test.py            # breaks the cutaway 250 ways; the tests must notice each
 python3 client/test/installer_test.py           # the setup script, on a made-up Wow.exe
 python3 client/tools/verify_sites.py Wow.exe    # your own Wow.exe against the patch sites
 tools/package.sh      # dist/WotLK-ARPG/: what gets installed

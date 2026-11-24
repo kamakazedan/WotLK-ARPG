@@ -42,7 +42,8 @@ looked into from above, and nothing of the world outside. Indoors is wherever
 the game itself has you indoors: where you cannot ride. A city's streets are
 outdoors. With "Outdoors, open up the building that hides you" ticked in the
 options, a building that comes between the camera and your character there
-is cut open, and only that one.
+is opened along your line of sight: what would cover your character on
+screen is not drawn, and what is behind or beside your character stays whole.
 
 Nothing here uses or changes any other addon. The game's own settings that
 the mode changes while you play (camera following, click-to-move and so on)
