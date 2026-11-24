@@ -525,6 +525,16 @@ inline bool UnitIsOutdoors(void* unit) {
     return reinterpret_cast<bool (__thiscall*)(void*)>(kUnitIsOutdoors)(unit);
 }
 
+// A unit's movement flags. The client's own IsSwimming() (0x006124A0) is
+// this test on the player.
+constexpr size_t kUnitMovementFlags = 0xA30;
+constexpr uint32_t kMovementSwimming = 0x00200000;
+
+inline bool UnitIsSwimming(void* unit) {
+    return (*reinterpret_cast<const uint32_t*>(static_cast<uint8_t*>(unit) + kUnitMovementFlags) &
+            kMovementSwimming) != 0;
+}
+
 // ---------------------------------------------------------------------------
 // Lua
 // ---------------------------------------------------------------------------
@@ -698,5 +708,21 @@ constexpr uintptr_t kSceneryInViewCall = 0x00799C52;
 constexpr uint8_t kSceneryInViewCallBytes[] = {0xE8, 0x59, 0xA3, 0x1E, 0x00};
 constexpr uintptr_t kCreatureInViewCall = 0x007932F2;
 constexpr uint8_t kCreatureInViewCallBytes[] = {0xE8, 0xB9, 0x0C, 0x1F, 0x00};
+
+// In the update of light and fog (0x007F16F0), which the world update makes
+// (through 0x007816F0) right after it has located the camera:
+// int __cdecl (void* fog, void** building, uint8_t* inside, void** groups,
+// float* depth) (0x0077FB90, which has no other caller): the fog of the
+// building the camera stands in, by the camera's position among the fog
+// volumes of the first group it is in (0x007A1150). 1 if there is one, and
+// then `inside` says whether one of the camera's groups is a room (flags
+// without 0x8 and 0x40) and `depth` how far the camera is into it. With
+// `inside` set the update blends the sky's fog towards the building's by
+// 0.04 of `depth`, start and end too, and the scene leaves out things that
+// are further off than the fog's end (0x00CD7668). For a ghost the routine
+// returns 0 at once and touches none of the five; the update then goes by
+// the sky's fog alone.
+constexpr uintptr_t kBuildingFogCall = 0x007F17B5;
+constexpr uint8_t kBuildingFogCallBytes[] = {0xE8, 0xD6, 0xE3, 0xF8, 0xFF};
 
 }  // namespace game

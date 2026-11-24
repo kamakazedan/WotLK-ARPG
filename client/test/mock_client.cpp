@@ -272,8 +272,11 @@ game::Vec3 g_playerPosition = {100.0f, 200.0f, 10.0f};
 void* g_playerVirtuals[32];
 struct MockObject {
     void** virtuals;
+    uint8_t rest[game::kUnitMovementFlags - sizeof(void**)];
+    uint32_t movementFlags;  // at the client's own place for them
 };
-MockObject g_player = {g_playerVirtuals};
+MockObject g_player = {g_playerVirtuals, {}, 0};
+static_assert(offsetof(MockObject, movementFlags) == game::kUnitMovementFlags, "the mock player's movement flags");
 uint32_t g_lookupTypeMask = 0;
 
 // The Lua stack as the library's functions see it.
@@ -597,6 +600,36 @@ alignas(4) uint8_t g_treeModel[0x10];    // a tree out on the terrain: nobody is
 bool g_tree = false;
 
 // In front of each of the two calls: push radius; push centre; mov ecx, view.
+// The fog of the building the camera stands in (0x0077FB90), which the
+// update of light and fog asks for once a frame, after the camera has been
+// located: five addresses pushed, the call, the stack put back.
+constexpr uintptr_t kBuildingFogEntry = game::kBuildingFogCall - 30;
+struct FogAnswer {
+    uint32_t fog[12];
+    void* building;
+    uint8_t inside;
+    void* groups;
+    float depth;
+};
+FogAnswer g_fogGiven;          // what the update's own variables hold
+uint32_t g_fogArguments[5];    // their addresses, as the update pushes them
+uint32_t g_fogResult = 0;
+int g_fogCalls = 0;            // times the client's routine was reached
+bool g_fogArgumentsRight = false;
+int g_cameraBuildingHasFog = 1;  // what the client's routine answers
+constexpr float kFogDepth = 12.5f;
+
+int __cdecl MockBuildingFog(void* fog, void** building, uint8_t* inside, void** groups, float* depth) {
+    ++g_fogCalls;
+    g_fogArgumentsRight = fog == g_fogGiven.fog && building == &g_fogGiven.building && inside == &g_fogGiven.inside &&
+                          groups == &g_fogGiven.groups && depth == &g_fogGiven.depth;
+    if (g_cameraBuildingHasFog == 1 && g_fogArgumentsRight) {
+        *inside = 1;
+        *depth = kFogDepth;
+    }
+    return g_cameraBuildingHasFog;
+}
+
 constexpr uintptr_t kSceneryInViewEntry = game::kSceneryInViewCall - 18;
 constexpr uintptr_t kCreatureInViewEntry = game::kCreatureInViewCall - 18;
 
@@ -1346,6 +1379,8 @@ bool AddressesFit() {
         kDrawMoreModelsCall,   kModelElementCall,      kDrawGroupRoutine,
         kDrawModelsRoutine,          kModelElementRoutine,
         CallTarget(game::kSceneryInViewCall, game::kSceneryInViewCallBytes),
+        game::kBuildingFogCall,      kBuildingFogEntry,
+        CallTarget(game::kBuildingFogCall, game::kBuildingFogCallBytes),
     };
     for (uintptr_t address : addresses) {
         if (!Fits(address)) {
@@ -1521,6 +1556,23 @@ void BuildClient() {
         Fixed<uint8_t>(at++) = 0xC3;
     }
     JumpAt(CallTarget(game::kSceneryInViewCall, game::kSceneryInViewCallBytes), CodeAddress(MockInView));
+
+    at = kBuildingFogEntry;
+    for (int i = 4; i >= 0; --i) {
+        pushFrom(&g_fogArguments[i]);
+    }
+    Bytes(at, game::kBuildingFogCallBytes, sizeof(game::kBuildingFogCallBytes));  // lands on kBuildingFogCall
+    static const uint8_t kDropFive[] = {0x83, 0xC4, 0x14};  // add esp,0x14
+    Bytes(at, kDropFive, sizeof(kDropFive));
+    Fixed<uint8_t>(at++) = 0xA3;  // mov [address], eax
+    Word(at, Address(&g_fogResult));
+    Fixed<uint8_t>(at++) = 0xC3;
+    JumpAt(CallTarget(game::kBuildingFogCall, game::kBuildingFogCallBytes), CodeAddress(MockBuildingFog));
+    g_fogArguments[0] = Address(g_fogGiven.fog);
+    g_fogArguments[1] = Address(&g_fogGiven.building);
+    g_fogArguments[2] = Address(&g_fogGiven.inside);
+    g_fogArguments[3] = Address(&g_fogGiven.groups);
+    g_fogArguments[4] = Address(&g_fogGiven.depth);
 
     const uintptr_t modelEntries[2] = {kDrawModelsEntry, kDrawMoreModelsEntry};
     const uint8_t* modelCalls[2] = {kDrawModelsCallBytes, kDrawMoreModelsCallBytes};
@@ -2287,6 +2339,16 @@ void TestGroundClicks() {
     g_cursor.guidHigh = 0x1FC00000;
     CheckPosition(ClickedPosition(), kRoofUnderCursor, "a hit on a transport is left in the transport's coordinates");
 
+    // In the water the way out is up.
+    g_player.movementFlags = game::kMovementSwimming | 0x1;
+    PointCursorAt(game::kHitGround, kRoofUnderCursor);
+    CheckPosition(ClickedPosition(), kRoofUnderCursor,
+                  "while the character swims a click high up stays where it is: that is the way out of the water");
+    g_player.movementFlags = ~game::kMovementSwimming;
+    PointCursorAt(game::kHitGround, kRoofUnderCursor);
+    CheckPosition(ClickedPosition(), kGroundUnderCursor, "(the client's flag for swimming, and no other, says so)");
+    g_player.movementFlags = 0;
+
     PointCursorAt(game::kHitGround, kRoofUnderCursor);
     g_cursor.rayStart = kRayEnd;
     g_cursor.rayEnd = kRayStart;
@@ -2325,6 +2387,13 @@ void TestGroundClicks() {
     Check(g_terrain.last.button == game::kClickRight && g_terrain.last.transportGuidLow == 0 &&
               g_terrain.last.transportGuidHigh == 0,
           "as a right click on plain ground");
+    g_player.movementFlags = game::kMovementSwimming;
+    WaitForRepeat();
+    Frame();
+    Check(g_click.performs == performs && g_terrain.count == 2,
+          "swimming, a held button over a unit keeps the character going just the same");
+    CheckPosition(g_terrain.last.position, kGroundUnderCursor, "level, towards the point under the cursor");
+    g_player.movementFlags = 0;
     Release();
 
     Section("ground clicks off again: ARPG_SetGroundClicks()");
@@ -2592,6 +2661,10 @@ struct DrawnFrame {
     game::Matrix view;
     game::Vec3 eye;
     int stackAfterLocate;
+    int stackAfterFog;
+    int fogAsked;             // times the client's routine for the fog of the camera's building was reached
+    uint32_t fogAnswer;       // what the update of light and fog was told
+    bool fogUntouched;        // none of the update's five variables was written
     int stackAfterStages;
     int stackAfterWalk;
     int stackAfterClear;
@@ -2675,6 +2748,24 @@ void RenderWorldFrame() {
     }
     const Direct3D before = g_d3d;
     CallClient(game::kLocateCameraCall, nullptr, nullptr, 0, &g_drawn.stackAfterLocate);
+
+    // The update of light and fog comes next in the world update, and asks
+    // what fog the building the camera stands in has.
+    const int fogCallsBefore = g_fogCalls;
+    for (uint32_t& word : g_fogGiven.fog) {
+        word = 0xF0F0F0F0;
+    }
+    g_fogGiven.building = nullptr;
+    g_fogGiven.inside = 0;
+    g_fogGiven.groups = nullptr;
+    g_fogGiven.depth = -1.0f;
+    g_fogResult = 0xDEAD;
+    CallClient(kBuildingFogEntry, nullptr, nullptr, 0, &g_drawn.stackAfterFog);
+    g_drawn.fogAsked = g_fogCalls - fogCallsBefore;
+    g_drawn.fogAnswer = g_fogResult;
+    g_drawn.fogUntouched = g_fogGiven.inside == 0 && g_fogGiven.depth == -1.0f && g_fogGiven.building == nullptr &&
+                           g_fogGiven.groups == nullptr && g_fogGiven.fog[0] == 0xF0F0F0F0 &&
+                           g_fogGiven.fog[11] == 0xF0F0F0F0;
 
     // The scene draw (0x0079A870). From the building the camera is in: walk
     // its rooms, then the outdoor world if the walk found a window onto it,
@@ -5205,6 +5296,85 @@ void TestCutawayRefusals() {
     g_playerPosition = kFeet;
 }
 
+// The fog of a building is for the character in it, not for a camera that
+// hangs in it.
+void TestBuildingFog() {
+    Section("fog: a building's fog is for the character in it, not for the camera that hangs in it");
+    void* const house = g_buildings[0].building;
+    void* const hut = g_buildings[2].building;
+    SetCamera(0.0, 60.0, 22.0);
+    g_playerPosition = kFeet;
+    g_outdoors = true;
+    g_characterRoom = {nullptr, 0};
+    g_cameraStandsIn = {hut, 0};  // the character in the street, the camera in the hut beside it
+    g_slabs[0].present = false;
+    g_slabs[1].present = false;
+    g_cameraBuildingHasFog = 1;
+    RenderWorldFrame();
+    Check(!Info().asked && g_drawn.fogAsked == 1 && g_fogArgumentsRight && g_drawn.fogAnswer == 1 &&
+              g_drawn.stackAfterFog == 0,
+          "with the cutaway off the client's routine is asked as ever, with the update's own five variables, "
+          "and its answer goes back");
+    Check(g_fogGiven.inside == 1 && g_fogGiven.depth == kFogDepth, "what it wrote into them is there");
+
+    SetCutaway(kCutHeight);
+    RenderWorldFrame();
+    Check(g_drawn.fogAsked == 0 && g_drawn.fogAnswer == 0 && g_drawn.stackAfterFog == 0,
+          "with it on: the camera's building has no fog to give while the character is in the street, and the "
+          "client's routine is not even asked");
+    Check(g_drawn.fogUntouched, "none of the five variables is written, as when the client's own routine says no");
+    g_cameraStandsIn = {nullptr, 0};
+    RenderWorldFrame();
+    Check(g_drawn.fogAsked == 0 && g_drawn.fogAnswer == 0, "the same with the camera in the open");
+
+    g_outdoors = false;
+    g_characterRoom = {house, kRoomOfCharacter};
+    g_cameraStandsIn = {hut, 0};
+    g_slabs[0] = {true, 15.0f, 16.0f, kEverywhere};
+    RenderWorldFrame();
+    Check(Info().inside && g_drawn.fogAsked == 1 && g_fogArgumentsRight && g_drawn.fogAnswer == 1 &&
+              g_fogGiven.depth == kFogDepth && g_drawn.stackAfterFog == 0,
+          "the character in a room and the frame drawn from it: the client's routine is asked, and answers for "
+          "that room");
+    g_cameraBuildingHasFog = 0;
+    RenderWorldFrame();
+    Check(g_drawn.fogAsked == 1 && g_drawn.fogAnswer == 0 && g_drawn.fogUntouched, "whatever it answers is what the update hears");
+    g_cameraBuildingHasFog = 1;
+
+    g_characterRoom = {nullptr, 0};
+    RenderWorldFrame();
+    CutawayInfo info = Info();
+    Check(info.indoors && !info.inside && g_drawn.fogAsked == 0 && g_drawn.fogAnswer == 0,
+          "indoors by the client's test but in no room that was found: the frame is not drawn from a room, and "
+          "there is no building's fog");
+
+    g_playerGuid = 0;
+    RenderWorldFrame();
+    Check(g_drawn.fogAsked == 1 && g_drawn.fogAnswer == 1, "with no character to go by, the fog is the client's business");
+    g_playerGuid = kMockPlayerGuid;
+    RenderWorldFrame();
+    CheckEqual(g_drawn.fogAsked, 0, "(the character back, it is this library's again)");
+    Fixed<uint8_t>(game::kInWorldFlag) = 0;
+    RenderWorldFrame();
+    Check(g_drawn.fogAsked == 1 && g_drawn.fogAnswer == 1, "on a loading screen it is the client's too");
+    Fixed<uint8_t>(game::kInWorldFlag) = 1;
+
+    g_outdoors = true;
+    g_slabs[0].present = false;
+    RenderWorldFrame();
+    CheckEqual(g_drawn.fogAsked, 0, "(in the world and in the street again)");
+    CutawayOff();
+    RenderWorldFrame();
+    Check(g_drawn.fogAsked == 1 && g_drawn.fogAnswer == 1, "and with the cutaway switched off, as it was before");
+
+    int popped = -1;
+    CallClient(kRegistrationRoutine, nullptr, nullptr, 0, &popped);
+    g_cameraStandsIn = {nullptr, 0};
+    ReleaseCamera();
+    ResetCamera(g_camera);
+    RenderWorldFrame();
+}
+
 // The opening outdoors needs three clip planes where the level cut needs
 // one.
 void TestOpeningRefused() {
@@ -5309,6 +5479,7 @@ int MockMain() {
     TestWhereAPieceStands();
     TestCutawayRefusals();
     TestOpeningRefused();
+    TestBuildingFog();
     TestUiReload();
 
     Print("\n");

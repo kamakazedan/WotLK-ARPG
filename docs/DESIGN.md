@@ -32,11 +32,22 @@ in the way. In the game that was no better: in a city one "part" is half a
 district, and what is cut level shows its inside. 0.7.0 does not cut level
 out of doors at all. It takes out of the buildings what covers the
 character on screen, along planes through the camera, no wider than the
-free space beside the character (not yet through the game). Added since,
-from playing it:
+free space beside the character. In the game that keeps its word and is
+still not it: in streets as tight as Stormwind's the camera hangs over, or
+in, the roofs of the houses in front, they fill the screen, and the
+opening is a keyhole in them. What was drawn on a screenshot instead: the
+roof and the upper floor of the house in front gone altogether. Two more
+things showed that are not the opening's doing, and 0.7.1 mends those
+first. Flat fog-coloured areas, the far wall sliced off and the character
+itself missing: going by the client's code, that is the client taking the
+fog of a building the camera hangs in while the character stands in the
+street (to be confirmed in the game). And in the water a click could not
+go up. How the buildings in front are to be dealt with is open
+again (see the end of this file). Added since, from playing it:
 
 7. Move clicks stay at ground level: a click on a roof or a treetop goes to
-   the ground under the cursor. (Built.)
+   the ground under the cursor. (Built. Not while the character swims: in
+   the water a click is somewhere to swim to, and the way out is up.)
 8. Sound is heard from the camera, not from the character. (Built.)
 9. A chosen skill on the left mouse button, and on the right when WASD is on.
    Clicking an enemy walks into the skill's range and uses it; clicking a
@@ -604,12 +615,46 @@ the middle of it. If Direct3D refuses three times the cut is given up,
 which the status says. And nothing here is written to the client's
 projection, its depth, or its own clip-plane state.
 
+Whose fog. The client takes a building's fog by where the camera is: the
+building the camera was located in, the fog volumes of the first of the
+camera's groups, and, if one of those groups is a room, how deep the
+camera is in it. With a room among them the fog of the sky is blended
+towards the building's, start and end too, by 0.04 of that depth, and
+parts of the scene that lie beyond the fog's end are not drawn. The
+depth is how far it is from the camera, through the doorways, to the
+nearest group that is outdoors (`0x007D8010`); where no way out is found
+it is taken as endless. That is meant for a camera a few yards behind the
+character. Here the camera hangs 20 yards up and away, in an attic or
+over a hall, while the character is in the street: from 25 yards "deep"
+the building's fog is in full, and its end can be nearer than the
+character. So unless the frame is
+drawn from the room the character is in, the routine that asks for a
+building's fog (`0x0077FB90`, called once, at `0x007F17B5`) is not called
+and the update is told there is none: what that routine itself answers
+for a ghost, with none of its five results written. The update then goes
+by the sky's fog alone. With the frame drawn from the character's room the
+client's routine is asked as ever. One more thing hangs on that answer:
+the record it gives has two fogs, and the second is for a camera that is
+under water (the update asks which liquid the camera is in, `0x00780620`,
+and for some liquids takes the building's underwater fog in place of the
+sky's, room or no room). With the character in the open that is not taken
+either, so a camera 16 yards over a character that deep in a building's
+water sees it without that fog.
+
 Other libraries. CoAVolFog patches `Wow.exe` too. None of the places it
-checks or patches is one of this library's sixteen (its list was read out
+checks or patches is one of this library's seventeen (its list was read out
 of its DLL: the fog routine `0x00873210`, which 0.4.0 detoured, is on it, and is
 left alone now; the calls at `0x004F9213` and `0x004FB042`, which would
 have been the obvious places to end the cut, are on it as well). It sets
-`D3DRS_CLIPPLANEENABLE` to 0 for its own passes.
+`D3DRS_CLIPPLANEENABLE` to 0 for its own passes. It also reads what the
+update of light and fog leaves behind: how far indoors the camera counts
+as being (`0x00D38B9C`), the building the camera stands in and how many
+groups, and it reads and writes the two fog ends (`0x00D38B94`,
+`0x00D38BA8`). Before it does, it compares code at `0x007F1931`,
+`0x007A11B0` and `0x007A11C7` with what it expects; none of those bytes is
+changed here. With a building's fog kept out as above, what it finds for
+a character in the street is what it would find with the camera in the
+street too.
 
 Known limits. The picture changes at the door, at once. Under a porch roof
 that counts as outdoors the roof is drawn, unless the opening under the
@@ -705,7 +750,7 @@ Four things stand in for the game, which CI cannot run:
 
 Each rule of the cutaway is also broken on purpose, one at a time, to see
 that a test notices (`client/test/mutation_test.py`, about half an hour,
-run by hand): 250 breakages, from "the plane's sideways term is not divided"
+run by hand): 255 breakages, from "the plane's sideways term is not divided"
 to "a level cut slides away under the open sky". Where one was not noticed,
 the tests were extended until it was, or the rule turned out not to be one
 and was taken out of the library.
@@ -774,6 +819,9 @@ at `0x00400000`.
 | Windows onto the outdoors | `0x00ADF570`, `0x00ADF58C` | each: left, top, right, bottom as fractions of the screen, then a depth that is below zero when nothing shows. Emptied (FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -1) in the scene update (`0x00795400`), and again after the walk of a second building. After the walk the first decides sky, clear colour, weather and light; the second goes to the outdoor culling (`0x0079A790`), skipped if empty |
 | Screen clear in the scene draw | `0x006813B0`, called at `0x0079AB9A` | cdecl: what (3: colour and depth), colour. The colour is the sky's or the fog's, by the first window |
 | Fog for what is drawn next | `0x00873210` | cdecl: float start, float end, float density, uint32* colour (0xAARRGGBB). Buildings and models set theirs through it; terrain does not. Not patched here: CoAVolFog patches it |
+| Light and fog for the frame | `0x007F16F0`, from `0x007816F0`, which the world update calls right after locating the camera | Fills two sets of colour, start, end and density at `0x00D38B8C` and `0x00D38BA0` (the record `0x007ECEF0` returns, `+0x8C` and `+0xA0`). Asks `0x0077FB90` (at `0x007F17B5`) for the fog of the camera's building; if there is one and the camera is in a room, blends both sets towards it by `0x00D38B9C` = 0.04 of the camera's depth in the room, at most 1. The world update then keeps the first set's end at `0x00CD7668`, and three routines of the scene compare a distance with it and leave out what is further off (`0x007B3F30`, `0x007C1730`, `0x007C3DB0`; which things each of them is for has not been worked out) |
+| Fog of the camera's building | `0x0077FB90` | cdecl: fog, building, inside, groups, depth, all out. Returns 0 at once for a ghost. Otherwise `0x007A1150`: nothing without a camera building (`0x00CD87A4`); marks `inside` and takes the depth (`0x007D8010`) for each of the camera's groups whose flags have neither `0x8` nor `0x40`; starts from the model's first fog (`+0x158`, 0x30 bytes each) and blends in those of the first camera group's four fog numbers (group `+0x58`) whose larger radius (`+0x14`) the camera is within |
+| Is the player swimming | `0x006124A0` (the script function) | `[player + 0xA30] & 0x200000` |
 | World switches | `0x00CD774C` | bit `0x100` clear: no buildings drawn, tested or looked up |
 | Scene draw | `0x0079A870` | cdecl. Finds what is in view (from the camera's building through doorways, `0x007AD1F0`, or the outdoor world), then `0x0079A260` (scenery and creatures of the visited groups, called at `0x0079AB2A`), `0x00793450` (called at `0x0079AB2F`), clears, has the model renderer work out what it will draw (`0x00821A20`, which is also where each model's lighting callback runs), hands the projection to the shaders, draws the groups (`0x007964A0`) |
 | Visit a building group | `0x00799310` | cdecl: group index, placed building. Queues the group once per frame (`+0xB4` of the placed group is its link in the frame's list `0x00CDB080`, nonzero while it is queued) and adds the view on top of the scene's stack as a window onto it. Needs the group's data loaded: no check. Reads `0x00CFBEB8` |
@@ -786,6 +834,54 @@ at `0x00400000`.
 | Last block of the client's Lua registrations | `0x00530F60` | ends in `ret` at `0x00530F85`; tail-called from `0x005120E0` |
 | Lua function address check | `0x0086B5A0` | range at `0x00D415B8`/`0x00D415BC`, filled in lazily by `0x0086B510` when either is zero |
 | Lua API | | `lua_gettop 0x0084DBD0`, `lua_type 0x0084DEB0`, `lua_tonumber 0x0084E030`, `lua_toboolean 0x0084E0B0`, `lua_pushnumber 0x0084E2A0`, `lua_pushstring 0x0084E350`, `lua_pushnil 0x0084E280` |
+
+## To be decided: the buildings in front
+
+What 0.7.0 looked like in Stormwind. The camera sits 22 yards from the
+character, 47 degrees up. A house is 15 to 20 yards tall and the streets
+are 8 to 12 yards wide, so whenever the character is behind a house the
+camera is right over that house's roof, or in its attic. The roof is a
+yard or two from the lens and fills the screen. The opening does what it
+was built to do, and what is left is a keyhole: less than a third of the
+screen's width at the character's feet. What was marked on a screenshot as wanted:
+the roof and the upper floor of the house in front gone altogether, its
+ground-floor wall left standing. Three more things from the same session:
+
+- A banner hanging on the wall in front is a model, not part of the
+  building. It is not wholly in the opening, so it is drawn whole, and
+  hides the character.
+- In a canal the thing in the way is the bank: the street the camera looks
+  down on. Opening it shows the bare ground the city's model lies on, which
+  is higher than the water, and that hides the character instead. Ground
+  must not be opened, and "ground" is not marked as such anywhere.
+- Flat fog-coloured areas, which had been taken for the hollow insides of
+  buildings since 0.6.0, are most likely the fog of the camera's building
+  (above). With that gone it is to be seen again what is really hollow.
+
+There are two ways on, and they go together.
+
+- **Roofs off.** On the camera's side of the character, nothing of a
+  building is drawn above a level a few yards over the ground; beyond the
+  character nothing is touched. That is the level cut of 0.5.0 with the
+  plane through the character added, and the picture that was asked for.
+  What it needs before it looks right: the level taken from the ground on
+  the camera's side and not from the character's feet (the canal); the
+  rooms of the houses that are cut drawn, and cut too, so that there are
+  floors to look down on; scenery above the level left out; and something
+  for shells that have no rooms, whose insides are the far wall's back and
+  the bare ground: their back faces drawn dark, which means changing the
+  client's own render states for those draws.
+- **The camera gets out of the way.** While a building hides the character,
+  the camera tilts up, as steep as it needs and no steeper, and comes back
+  down when the line of sight at the lower angle is clear again. Nothing
+  is cut, so nothing shows its inside. At 75 degrees a 10 yard wall hides
+  only what is within 3 yards of its foot, where at 47 it hides 9. What
+  still hides the character at the steepest angle is what is right over
+  it, an archway or a passage, and that is where the opening as it is
+  works: there the hole is in the one roof over the character, not in
+  everything between it and a far-off camera. The price is that the camera
+  is no longer fixed, and that the view is more from above, and shorter
+  ahead, while it is lifted.
 
 ## To be decided: walking around things
 

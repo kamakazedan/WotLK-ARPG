@@ -26,14 +26,15 @@ in from, with or without this addon, finds your settings as you left them.
 | No scroll zoom, camera stops following the character | addon | done |
 | Hold the left mouse button to keep moving; click to interact, attack, loot | client library | works in game |
 | Camera locked facing north at a set angle and distance, through walls | client library | works in game |
-| Clicks on roofs and treetops move to the ground under the cursor | client library | works in game |
+| Clicks on roofs and treetops move to the ground under the cursor | client library | works in game; since 0.7.1 not while you swim, where the way out is up |
 | Sound heard from the camera, so left and right match the screen | addon | done |
 | Settings panel; settings shared by every character | addon | done |
 | The game's own settings as you left them on every other client | addon | fixed in 0.4.0 |
 | Indoors, the building shown from inside, looked into from above | client library | works in game since 0.5.0; with a fog mod the background comes out grey, not black |
 | Indoors, walls, beams and upper floors cut off at a set height | client library | works in game |
 | Indoors, scenery and creatures that stand outside the rooms left out | client library | since 0.6.0 |
-| Outdoors, whatever of a building covers the character opened along the line of sight; what is behind or beside the character stays whole | client library | new in 0.7.0 (0.6.0 cut whole parts of a city level, and showed their insides); not yet run in game; off unless asked for |
+| Outdoors, whatever of a building covers the character opened along the line of sight; what is behind or beside the character stays whole | client library | since 0.7.0; does what it says in the game, and in tight streets that is too little: see the limits. Being reworked; off unless asked for |
+| Fog and view distance of the place your character is in, not of a building the camera happens to hang in | client library | new in 0.7.1; not yet run in game |
 | A skill on the left mouse button (and the right, with WASD on): walk into range, then cast | addon + client library | next |
 | Bigger minimap; click it to walk there | addon + client library | planned |
 | Walking around obstacles, up ramps and down stairs to where you clicked | client library + server pathing | planned |
@@ -165,6 +166,10 @@ Without the client library the addon still works: one click per move,
 - Under a porch roof or an archway that the game counts as outdoors you are
   outdoors, and the roof is drawn unless "Outdoors, open up the building
   that hides you" is ticked.
+- In streets as tight as Stormwind's the camera hangs right over the roofs
+  of the houses in front of your character, or inside them. They fill the
+  screen, and the slot is a keyhole in them. What to do about that instead
+  is being decided.
 - Outdoors the slot through a building has hard, straight edges: nothing
   fades, and a tower in front of you gets a slot through it, not taken
   away. Its lower edge is your line of sight to your character's feet, so
@@ -249,7 +254,7 @@ indoors" option then decides what happens under a roof.
 ```
 client/build.sh       # build/WotLK-ARPG.dll and build/mock-client.exe (clang, lld; any OS)
 client/test/run.sh    # hook engine test, then the library against a mock client (Linux)
-python3 client/test/mutation_test.py            # breaks the cutaway 250 ways; the tests must notice each
+python3 client/test/mutation_test.py            # breaks the cutaway 255 ways; the tests must notice each
 python3 client/test/installer_test.py           # the setup script, on a made-up Wow.exe
 python3 client/tools/verify_sites.py Wow.exe    # your own Wow.exe against the patch sites
 tools/package.sh      # dist/WotLK-ARPG/: what gets installed
