@@ -577,58 +577,16 @@ inline void lua_pushstring(lua_State* L, const char* value) {
 // What is drawn, piece by piece
 // ---------------------------------------------------------------------------
 
-// This frame's list of placed groups to draw (the visit puts them on it):
-// the head, and where in a placed group the link sits. The link's second
-// word, kPlacedGroupQueued, is the next group; the list ends at a null or
-// odd value.
-constexpr uintptr_t kQueuedGroupsHead = 0x00CDB088;
-constexpr uintptr_t kQueuedGroupsLinkOffset = 0x00CDB080;  // int32_t
-
-constexpr size_t kPlacedGroupOwner = 0x20;   // in a placed group: a link whose word at kOwnerBuilding is the
-constexpr size_t kOwnerBuilding = 0x08;      // placed building it belongs to
-constexpr size_t kBuildingPlacement = 0xB0;  // in a placed building: Matrix, world coordinates to the model's own
+// In a placed building: Matrix, world coordinates to the model's own. The
+// client passes its address along when it draws one of the building's
+// groups.
+constexpr size_t kBuildingPlacement = 0xB0;
 
 // A piece of scenery or a creature, as the scene files it under the places
 // it stands in (a placed group keeps a list of each, at +0x78 and +0x84).
 constexpr size_t kSceneModel = 0x34;   // its model, null while that is loading
 constexpr size_t kSceneCentre = 0x38;  // Vec3, world coordinates: the centre of the sphere it is tested by
 constexpr size_t kSceneRadius = 0x44;  // float
-
-// Whether a line meets one building group's surfaces. What the client does
-// for each group of a building a line passes (0x007AECB0, and 0x007D59B0 for
-// the camera's room): the line is taken to the model's coordinates
-// (kBuildingPlacement), put to the group's box, and then to its surfaces.
-//
-// bool __thiscall Model(const Vec3* from, const Vec3* to, uint32_t group)
-// (0x007AE880): whether the line touches the group's box. False as well for
-// a model or a group whose data is not loaded.
-constexpr uintptr_t kLineTouchesGroupBox = 0x007AE880;
-// bool __thiscall GroupData(const Vec3 line[2], float* fraction, uint32_t
-// flags, uint32_t surfaces, uint8_t* out, void* building) (0x007CB0C0).
-// `fraction` goes in as how far along the line counts and comes back as how
-// far along the hit is. `flags` are the line test's own (only its liquid
-// bits are looked at here); `surfaces` is the mask of surface kinds to pass
-// over, which 0x007AE140 makes from the flags: 0x82 for kIntersectBuildings.
-// The client zeroes five words of scratch (kLineScratch) before every call.
-constexpr uintptr_t kLineMeetsGroup = 0x007CB0C0;
-constexpr uintptr_t kLineScratch = 0x00CB7528;
-constexpr size_t kLineScratchWords = 5;
-constexpr uint32_t kBuildingSurfacesPassed = 0x82;
-
-inline bool LineTouchesGroupBox(void* model, const Vec3* from, const Vec3* to, uint32_t group) {
-    return reinterpret_cast<bool (__thiscall*)(void*, const Vec3*, const Vec3*, uint32_t)>(kLineTouchesGroupBox)(
-        model, from, to, group);
-}
-
-inline bool LineMeetsGroup(void* groupData, const Vec3* line, float* fraction, uint32_t flags, uint32_t surfaces,
-                           uint8_t* out, void* building) {
-    uint32_t* scratch = reinterpret_cast<uint32_t*>(kLineScratch);
-    for (size_t i = 0; i < kLineScratchWords; ++i) {
-        scratch[i] = 0;
-    }
-    return reinterpret_cast<bool (__thiscall*)(void*, const Vec3*, float*, uint32_t, uint32_t, uint8_t*, void*)>(
-        kLineMeetsGroup)(groupData, line, fraction, flags, surfaces, out, building);
-}
 
 // ---------------------------------------------------------------------------
 // Hook sites: address, the stock bytes that must be there, and how many of
