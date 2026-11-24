@@ -200,6 +200,7 @@ struct State {
     bool indoors;       // the character is in a building: in a room the scene's lookup found or, failing that,
                         // by the client's indoors test
     bool interior;      // the character is in a room, and this frame is drawn from it: the inside view
+    bool watching;      // this frame's picture is the cutaway's business: switched on, in the world, character found
     float overhead;     // yards over the feet of what is overhead, 0 if nothing was found (looked for indoors only)
     float between;      // yards over the feet of the lowest thing between camera and character, 0 if nothing
                         // (not looked for in the inside view, where walls do not hide what is behind them)
@@ -801,6 +802,26 @@ void LeaveRoomWithoutCharacter() {
     *reinterpret_cast<char*>(game::kSceneCameraGroupName) = '\0';
 }
 
+// The fog of a building is for whoever is in the building. The client asks
+// for it by where the camera is: which building, which of its groups, how
+// deep in. A camera that does not stop at walls hangs in an attic or over a
+// hall while the character is in the street, and gets the fog of that
+// place: thick, and ending a few dozen yards off, and the client leaves
+// out what is further away than a fog's end. From high enough up that is
+// the far side of the street, or all of it and the character too. So
+// unless the frame is drawn from the room the character is in, there is no
+// building's fog at all: the answer the client's own routine gives for a
+// camera in no building.
+using BuildingFog = int (__cdecl*)(void* fog, void** building, uint8_t* inside, void** groups, float* depth);
+BuildingFog g_originalBuildingFog = nullptr;
+
+int __cdecl BuildingFogHook(void* fog, void** building, uint8_t* inside, void** groups, float* depth) {
+    if (g_state.watching && !g_state.interior) {
+        return 0;
+    }
+    return g_originalBuildingFog(fog, building, inside, groups, depth);
+}
+
 void StopCut();
 
 using Plain = void (__cdecl*)();
@@ -822,6 +843,7 @@ void __cdecl LocateCameraHook() {
         g_state.blocked = false;
         g_state.blockPending = false;
         g_state.open = false;
+        g_state.watching = false;
         g_window.on = false;
         g_state.overhead = 0.0f;
         g_state.between = 0.0f;
@@ -829,6 +851,7 @@ void __cdecl LocateCameraHook() {
         g_originalLocateCamera();
         return;
     }
+    g_state.watching = true;
 
     // The client's routine asks which building lies under the camera, by a
     // line straight down from kSceneCameraPosition, which it reads once at
@@ -1751,6 +1774,8 @@ bool Install() {
                                   game::kCreatureInViewCallBytes, sizeof(game::kCreatureInViewCallBytes), 0};
     const hook::Site group = {"Cutaway: building group drawn", game::kDrawGroupCall, game::kDrawGroupCallBytes,
                               sizeof(game::kDrawGroupCallBytes), 0};
+    const hook::Site fog = {"Cutaway: fog of the camera's building", game::kBuildingFogCall,
+                            game::kBuildingFogCallBytes, sizeof(game::kBuildingFogCallBytes), 0};
 
     // Each hook passes straight through while g_installed is false, so a
     // partial set does no harm; the cutaway only runs with all nine.
@@ -1789,6 +1814,14 @@ bool Install() {
                                                           reinterpret_cast<void**>(&g_originalDrawGroup)));
     g_canFilter = all && filter;
     g_canChoose = all && filter && choose;
+
+    // And one more, apart from those: without it the fog is that of
+    // wherever the camera hangs.
+    if (!hook::IsActive(hook::RedirectCall(fog, reinterpret_cast<void*>(BuildingFogHook),
+                                           reinterpret_cast<void**>(&g_originalBuildingFog))) &&
+        all) {
+        logfile::Write("Cutaway: the fog stays that of the building the camera is in, wherever the character is");
+    }
     if (all && !g_canChoose) {
         logfile::Write("Cutaway: %s", g_canFilter ? "cannot tell building groups apart as they are drawn; nothing "
                                                     "is opened up under the open sky"

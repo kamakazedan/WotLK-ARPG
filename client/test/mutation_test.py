@@ -595,6 +595,21 @@ MUTATIONS = [
      [("    const float atEye = side * Above(plane, g_state.eye) + seam;",
        "    const float atEye = side * Above(plane, g_state.eye) - seam;")]),
 
+    # The fog of the place the character is in
+    ("a building's fog reaches the street through a camera that hangs in the building",
+     [("    if (g_state.watching && !g_state.interior) {\n        return 0;",
+       "    if (g_state.watching && !g_state.interior && g_state.givenUp) {\n        return 0;")]),
+    ("no building has a fog, not even the one the character is in",
+     [("    if (g_state.watching && !g_state.interior) {\n        return 0;",
+       "    if (g_state.watching) {\n        return 0;")]),
+    ("the fog is taken out of the client's hands while the cutaway is off",
+     [("    if (g_state.watching && !g_state.interior) {\n        return 0;",
+       "    if (!g_state.interior) {\n        return 0;")]),
+    ("the library goes on answering for the fog after it has stopped watching",
+     [("        g_state.open = false;\n        g_state.watching = false;", "        g_state.open = false;")]),
+    ("the library never takes the fog on",
+     [("    g_state.watching = true;", "    g_state.watching = false;")]),
+
     # The planes on the device
     ("the plane is measured from the wrong height",
      [("        const Plane level = {{0.0f, 0.0f, 1.0f}, -g_state.planeZ};",

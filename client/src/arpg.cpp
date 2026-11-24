@@ -12,7 +12,7 @@
 #include "log.h"
 #include "win.h"
 
-#define ARPG_VERSION "0.7.0"
+#define ARPG_VERSION "0.7.1"
 
 namespace {
 
@@ -171,6 +171,8 @@ uint32_t __fastcall CameraCollisionHook(void* camera, void* /*edx*/, float* targ
 //     cursor passes over a creature, instead of stopping.
 // On foot only x and y decide when the character has arrived, so it does not
 // matter that the real ground there may be a little higher or lower.
+// In the water the height does count: a click is somewhere to swim to, and
+// the way out is up. So while the character swims no click is moved.
 // ---------------------------------------------------------------------------
 
 struct GroundClicks {
@@ -215,10 +217,12 @@ void LowerClickToGround(uint8_t* worldFrame) {
     if (game::HitIsOnTransport(worldFrame)) {
         return;  // its position is in the transport's coordinates, not the world's
     }
-    game::Vec3 feet;
-    if (!PlayerPosition(&feet)) {
+    void* player = game::InWorld() ? game::PlayerObject() : nullptr;
+    if (player == nullptr || game::UnitIsSwimming(player)) {
         return;
     }
+    game::Vec3 feet;
+    game::ObjectPosition(player, &feet);
     game::Vec3& hit = game::At<game::Vec3>(worldFrame, game::kWorldFrameHitPosition);
     if (hit.z - feet.z <= g_ground.maxRise) {
         return;  // already somewhere to walk
