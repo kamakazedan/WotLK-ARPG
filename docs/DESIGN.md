@@ -576,7 +576,7 @@ to either side of the character, for how wide it may be.
   behind the character out with it.
 - A cut does not outlive the place it was made for. A level cut is gone
   the moment the character is under the open sky: sliding away, it would
-  for a third of a second take the top off everything in view, which is
+  for a quarter of a second take the top off everything in view, which is
   what is not to happen out there. An opening is gone the moment the
   character is under a roof. Either begins from the top.
 - With the camera straight over the character (less than half a yard to
