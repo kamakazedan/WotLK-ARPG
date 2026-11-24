@@ -186,10 +186,10 @@ makeSlider("cutawayHeight", {
 
 makeCheck("cutawayOutdoors", {
     y = -274, label = "Outdoors, open up the building that hides you",
-    tooltip = "When a roof, an archway or a wall comes between the camera and your character outdoors, the "
-        .. "parts of the building that are in the way are cut just under where they hide you, with the rooms "
-        .. "inside them. Other buildings, the street and the terrain stay whole. (With a client library older "
-        .. "than 0.6.0, everything on screen is cut instead.)",
+    tooltip = "Outdoors, when a roof, an archway or a wall hides your character, it is opened along your line "
+        .. "of sight: what covers your character on screen is not drawn, with a strip to either side as wide as "
+        .. "the free space beside it. What is behind or beside your character stays whole. (Client libraries "
+        .. "older than 0.7.0 cut buildings level instead.)",
     apply = applyCutaway,
 })
 

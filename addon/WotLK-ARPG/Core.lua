@@ -39,7 +39,7 @@ local defaults = {
     camDistance = 22,       -- yards from the character
     cutaway = true,         -- indoors, show only the inside of the building, looked into from above
     cutawayHeight = 4,      -- yards above the character's feet at which that view is cut off
-    cutawayOutdoors = false, -- outdoors, cut open the parts of a building that hide the character
+    cutawayOutdoors = false, -- outdoors, open up what stands between the camera and the character
     indoorCollision = true, -- without the inside view: indoors, let the camera move in when a wall is in the way
     groundClicks = true,    -- move clicks on roofs and treetops go to the ground under the cursor
     groundClickHeight = 3,  -- yards above the character's feet that still count as somewhere to walk
@@ -69,6 +69,7 @@ ns.FEATURE_CAMERA_DISTANCE = 8
 ns.FEATURE_CUTAWAY = 16     -- up to library 0.3.0 this alone: the world cut open, outdoors and all
 ns.FEATURE_INSIDE_VIEW = 32 -- from 0.4.0: buildings shown from inside
 ns.FEATURE_ROOMS = 64       -- from 0.5.0: rooms told from streets; ARPG_CutawayInfo says what was found
+ns.FEATURE_OPENING = 128    -- from 0.7.0: outdoors, an opening along the line of sight in place of a level cut
 
 function ns:HasClient()
     return type(ARPG_ClientVersion) == "function"
@@ -404,10 +405,11 @@ function ns:PrintCutawayProof()
         ns.Print(format("Indoors: %s. The inside view is switched off.", fallback))
         return
     end
-    -- The last five are nil with a library older than 0.6.0.
+    -- The last two are nil with a library older than 0.7.0, the five before
+    -- them with one older than 0.6.0.
     local asked, cutting, height, frames, cut, skipped, rooms, indoors, _, refused, overhead, between, inside,
         insideFrames, draws, group, groupFlags, area, doorsOut, parts, sceneryOut, creaturesOut, canChoose,
-        canFilter = ARPG_CutawayInfo()
+        canFilter, openLeft, openRight = ARPG_CutawayInfo()
     if asked ~= 1 then
         ns.Print("Inside view: not in use at the moment.")
         return
@@ -433,25 +435,24 @@ function ns:PrintCutawayProof()
     elseif cutting == 1 then
         local hidden = (between or 0) > 0 and format("a building hides you %.1f yd up", between)
             or "nothing hides you any more"
-        if parts == nil or canChoose == 0 then
+        if not ns:ClientHas(ns.FEATURE_OPENING) then
+            -- A library older than 0.7.0 cuts level outdoors.
             ns.Print(format("Outdoors: %s; the world is %s.", hidden, cutText))
-            if canChoose == 0 then
-                ns.Print("  |cffffd200The library cannot tell the pieces of the world apart in this game file|r, "
-                    .. "so everything on screen is cut.")
-            end
-        elseif parts < 0 then
-            ns.Print(format("Outdoors: %s; which part of it could not be told, so the whole world is %s.", hidden,
-                cutText))
-        elseif parts == 0 then
-            ns.Print(format("Outdoors: %s; the cut is on its way out.", hidden))
         else
-            ns.Print(format("Outdoors: %s; %d part%s of it, with the rooms inside, %s. The rest is whole.", hidden,
-                parts, parts == 1 and "" or "s", cutText))
+            -- (parts is -1 until the first frame of an opening has been drawn.)
+            local opened = math.max(parts or 0, 0)
+            ns.Print(format("Outdoors: %s; opened along your line of sight, %.1f yd to the left of you and %.1f "
+                .. "to the right, down to %.1f yd above your feet (%d part%s of buildings drawn with a piece "
+                .. "taken out). Everything else is whole.", hidden, openLeft or 0, openRight or 0, height, opened,
+                opened == 1 and "" or "s"))
             if (sceneryOut or 0) + (creaturesOut or 0) > 0 then
-                ns.Print(format("  Left out for sitting on those parts above the cut: scenery %d, creatures and "
-                    .. "objects %d.", sceneryOut or 0, creaturesOut or 0))
+                ns.Print(format("  Left out for standing in that opening: scenery %d, creatures and objects %d.",
+                    sceneryOut or 0, creaturesOut or 0))
             end
         end
+    elseif db.cutawayOutdoors and canChoose == 0 then
+        ns.Print("Inside view: on. You are outdoors. |cffffd200The library cannot open buildings up in this game "
+            .. "file|r, so nothing is done about one that hides you.")
     else
         ns.Print("Inside view: on. You are outdoors, and nothing is cut.")
     end
